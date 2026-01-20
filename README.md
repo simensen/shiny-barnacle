@@ -383,7 +383,66 @@ This proxy implements **buffer-and-replay** for streaming:
 
 ## Configuration
 
-### Command Line Options
+### Transform Proxy Command Line Options
+
+```bash
+python transform_proxy.py [OPTIONS]
+
+Connection:
+  --backend, -b URL     Backend llama.cpp server URL (default: http://localhost:8080)
+  --port, -p PORT       Port to listen on (default: 4000)
+  --host HOST           Host to bind to (default: 0.0.0.0)
+
+Behavior:
+  --no-transform        Disable transformation (passthrough mode)
+  --debug               Enable debug logging
+  --no-log-params       Disable logging of sampling parameters
+
+Sampling Overrides (optional - override client values):
+  --temperature FLOAT   Override temperature (e.g., 0.7)
+  --top-p FLOAT         Override top_p (e.g., 0.9)
+  --top-k INT           Override top_k (e.g., 40)
+  --min-p FLOAT         Override min_p (e.g., 0.05)
+  --repeat-penalty FLOAT Override repeat_penalty (e.g., 1.0)
+  --presence-penalty FLOAT Override presence_penalty
+  --frequency-penalty FLOAT Override frequency_penalty
+```
+
+### Sampling Parameter Overrides
+
+When you specify a sampling parameter at the proxy level, it **overrides** whatever the client sends. If not specified, client values pass through unchanged to the backend.
+
+```bash
+# Force specific temperature and repeat_penalty for all requests
+python transform_proxy.py --temperature 0.7 --repeat-penalty 1.0
+
+# Just observe what clients send (no overrides)
+python transform_proxy.py --debug
+```
+
+**Log output shows what's happening:**
+```
+Sampling params - Client: {'temperature': 0.6}, Proxy overrides: {'temperature': 0.7}, Effective: {'temperature': 0.7}
+```
+
+### Runtime Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/config` | GET | View current configuration including sampling overrides |
+| `/stats` | GET | View statistics and current sampling config |
+| `/stats/reset` | POST | Reset statistics counters |
+| `/health` | GET | Health check |
+
+```bash
+# Check current config
+curl -s http://localhost:4000/config | jq
+
+# Check stats and see what overrides are active
+curl -s http://localhost:4000/stats | jq '.sampling_overrides'
+```
+
+### Retry Proxy Command Line Options
 
 ```bash
 python proxy.py [OPTIONS]
@@ -400,37 +459,17 @@ Options:
 ### Examples
 
 ```bash
-# Basic usage
-python proxy.py
+# Basic usage - transform proxy
+python transform_proxy.py
 
 # Custom backend and port
-python proxy.py --backend http://192.168.1.100:8080 --port 5000
+python transform_proxy.py --backend http://192.168.1.100:8080 --port 5000
 
-# More retries, debug logging
+# With sampling overrides
+python transform_proxy.py --temperature 0.7 --repeat-penalty 1.0 --top-p 0.9
+
+# Retry proxy with more retries
 python proxy.py --max-retries 3 --debug
-
-# Disable hints (rely on temperature adjustment only)
-python proxy.py --no-hints
-```
-
-### Configuring in Code
-
-Edit `proxy.py` to modify the `ProxyConfig` class:
-
-```python
-@dataclass
-class ProxyConfig:
-    backend_url: str = "http://localhost:8080"
-    port: int = 4000
-    max_retries: int = 2
-    retry_delay: float = 0.5
-    
-    # Add custom malformed patterns
-    malformed_patterns: list = field(default_factory=lambda: [
-        r'<function\s*=',
-        r'<function\s+name\s*=',
-        # Add your own patterns here
-    ])
 ```
 
 ---
@@ -693,7 +732,7 @@ sudo systemctl status llm-proxy
 sudo journalctl -u llm-proxy -f
 ```
 
-### Configuration Options
+### Systemd Environment Configuration
 
 Edit the `Environment=` lines in the service file:
 

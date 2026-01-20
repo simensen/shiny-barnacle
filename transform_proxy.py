@@ -104,10 +104,86 @@ class ProxyConfig:
     
     # Streaming settings
     stream_buffer_timeout: float = 120.0
+    
+    # Sampling parameters (None means use client's value or backend default)
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    repeat_penalty: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    
+    # Debug settings
+    log_sampling_params: bool = True  # Log sampling params for each request
 
 
 config = ProxyConfig()
 app = FastAPI(title="LLM Response Transformer Proxy")
+
+
+def apply_sampling_params(body: dict) -> dict:
+    """Apply proxy-level sampling parameters to request body.
+    
+    Proxy params override client params when set.
+    Returns the modified body and logs the effective params.
+    """
+    # Collect what the client sent
+    client_params = {
+        "temperature": body.get("temperature"),
+        "top_p": body.get("top_p"),
+        "top_k": body.get("top_k"),
+        "min_p": body.get("min_p"),
+        "repeat_penalty": body.get("repeat_penalty"),
+        "presence_penalty": body.get("presence_penalty"),
+        "frequency_penalty": body.get("frequency_penalty"),
+    }
+    
+    # Apply proxy overrides
+    overrides = {}
+    if config.temperature is not None:
+        body["temperature"] = config.temperature
+        overrides["temperature"] = config.temperature
+    if config.top_p is not None:
+        body["top_p"] = config.top_p
+        overrides["top_p"] = config.top_p
+    if config.top_k is not None:
+        body["top_k"] = config.top_k
+        overrides["top_k"] = config.top_k
+    if config.min_p is not None:
+        body["min_p"] = config.min_p
+        overrides["min_p"] = config.min_p
+    if config.repeat_penalty is not None:
+        body["repeat_penalty"] = config.repeat_penalty
+        overrides["repeat_penalty"] = config.repeat_penalty
+    if config.presence_penalty is not None:
+        body["presence_penalty"] = config.presence_penalty
+        overrides["presence_penalty"] = config.presence_penalty
+    if config.frequency_penalty is not None:
+        body["frequency_penalty"] = config.frequency_penalty
+        overrides["frequency_penalty"] = config.frequency_penalty
+    
+    # Log the parameters
+    if config.log_sampling_params:
+        # Filter out None values for cleaner logging
+        client_set = {k: v for k, v in client_params.items() if v is not None}
+        effective = {
+            "temperature": body.get("temperature"),
+            "top_p": body.get("top_p"),
+            "top_k": body.get("top_k"),
+            "min_p": body.get("min_p"),
+            "repeat_penalty": body.get("repeat_penalty"),
+            "presence_penalty": body.get("presence_penalty"),
+            "frequency_penalty": body.get("frequency_penalty"),
+        }
+        effective_set = {k: v for k, v in effective.items() if v is not None}
+        
+        if overrides:
+            logger.info(f"Sampling params - Client: {client_set}, Proxy overrides: {overrides}, Effective: {effective_set}")
+        else:
+            logger.info(f"Sampling params - Client: {client_set} (no proxy overrides)")
+    
+    return body
 
 # =============================================================================
 # Tool Call Parser
@@ -587,41 +663,53 @@ async def collect_stream(
     chunks = []
     metadata = {}
     
-    async with client.stream(
-        "POST",
-        f"{config.backend_url}/v1/chat/completions",
-        json=body,
-        timeout=config.stream_buffer_timeout
-    ) as response:
-        response.raise_for_status()
-        
-        async for line in response.aiter_lines():
-            if not line or not line.startswith("data: "):
-                continue
+    try:
+        async with client.stream(
+            "POST",
+            f"{config.backend_url}/v1/chat/completions",
+            json=body,
+            timeout=config.stream_buffer_timeout
+        ) as response:
+            # Check for errors before trying to read stream
+            if response.status_code >= 400:
+                error_body = await response.aread()
+                logger.error(f"Backend returned {response.status_code}: {error_body.decode()}")
+                raise httpx.HTTPStatusError(
+                    f"Backend error: {error_body.decode()}", 
+                    request=response.request, 
+                    response=response
+                )
             
-            data = line[6:]
-            if data == "[DONE]":
-                break
-            
-            try:
-                chunk = json.loads(data)
-                chunks.append(chunk)
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
                 
-                if "choices" in chunk and chunk["choices"]:
-                    delta = chunk["choices"][0].get("delta", {})
-                    content_piece = delta.get("content")
-                    if content_piece is not None:
-                        full_content += content_piece
-                    if chunk["choices"][0].get("finish_reason"):
-                        metadata["finish_reason"] = chunk["choices"][0]["finish_reason"]
+                data = line[6:]
+                if data == "[DONE]":
+                    break
                 
-                if "model" in chunk:
-                    metadata["model"] = chunk["model"]
-                if "id" in chunk:
-                    metadata["id"] = chunk["id"]
+                try:
+                    chunk = json.loads(data)
+                    chunks.append(chunk)
                     
-            except json.JSONDecodeError:
-                continue
+                    if "choices" in chunk and chunk["choices"]:
+                        delta = chunk["choices"][0].get("delta", {})
+                        content_piece = delta.get("content")
+                        if content_piece is not None:
+                            full_content += content_piece
+                        if chunk["choices"][0].get("finish_reason"):
+                            metadata["finish_reason"] = chunk["choices"][0]["finish_reason"]
+                    
+                    if "model" in chunk:
+                        metadata["model"] = chunk["model"]
+                    if "id" in chunk:
+                        metadata["id"] = chunk["id"]
+                        
+                except json.JSONDecodeError:
+                    continue
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error from backend: {e}")
+        raise
     
     return full_content, chunks, metadata
 
@@ -637,7 +725,34 @@ async def handle_streaming_request(
     
     # Create client inside the generator so it stays open during iteration
     async with httpx.AsyncClient() as client:
-        content, original_chunks, metadata = await collect_stream(client, body)
+        try:
+            content, original_chunks, metadata = await collect_stream(client, body)
+        except httpx.HTTPStatusError as e:
+            # Return error as SSE event
+            logger.error(f"Backend error during streaming: {e}")
+            stats.record_backend_error()
+            error_chunk = {
+                "error": {
+                    "message": str(e),
+                    "type": "backend_error",
+                    "code": e.response.status_code if e.response else 500
+                }
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        except Exception as e:
+            logger.error(f"Unexpected error during streaming: {e}")
+            stats.record_backend_error()
+            error_chunk = {
+                "error": {
+                    "message": str(e),
+                    "type": "proxy_error"
+                }
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         
         # Log what we collected for debugging
         logger.info(f"Stream collected: {len(original_chunks)} chunks, {len(content)} chars content")
@@ -699,6 +814,9 @@ async def chat_completions(request: Request):
     
     body = await request.json()
     is_streaming = body.get("stream", False)
+    
+    # Apply proxy-level sampling parameters (and log them)
+    body = apply_sampling_params(body)
     
     logger.info(f"Request: streaming={is_streaming}")
     
@@ -766,12 +884,41 @@ async def get_stats():
             "failed": stats.failed_transforms,
             "backend_errors": stats.backend_errors
         },
+        "sampling_overrides": {
+            "temperature": config.temperature,
+            "top_p": config.top_p,
+            "top_k": config.top_k,
+            "min_p": config.min_p,
+            "repeat_penalty": config.repeat_penalty,
+            "presence_penalty": config.presence_penalty,
+            "frequency_penalty": config.frequency_penalty,
+        },
         "interpretation": {
             "passthrough": "Model output was already valid - proxy just passed it through",
             "transformed": "Model output was malformed - proxy fixed it",
             "if_all_passthrough": "Great! The model is producing valid tool calls on its own",
             "if_zero_total": "No requests recorded yet - check if requests are reaching the proxy"
         }
+    }
+
+
+@app.get("/config")
+async def get_config():
+    """Get current proxy configuration."""
+    return {
+        "backend_url": config.backend_url,
+        "transform_enabled": config.transform_enabled,
+        "log_sampling_params": config.log_sampling_params,
+        "sampling_overrides": {
+            "temperature": config.temperature,
+            "top_p": config.top_p,
+            "top_k": config.top_k,
+            "min_p": config.min_p,
+            "repeat_penalty": config.repeat_penalty,
+            "presence_penalty": config.presence_penalty,
+            "frequency_penalty": config.frequency_penalty,
+        },
+        "note": "Sampling overrides: null means client value passes through, set value overrides client"
     }
 
 
@@ -864,27 +1011,109 @@ async def passthrough(request: Request, path: str):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM Response Transformer Proxy")
-    parser.add_argument("--backend", "-b", default="http://localhost:8080")
-    parser.add_argument("--port", "-p", type=int, default=4000)
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--no-transform", action="store_true", help="Disable transformation")
-    parser.add_argument("--debug", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="LLM Response Transformer Proxy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Sampling Parameters:
+  When specified, these override whatever the client sends.
+  If not specified, client values pass through to backend.
+
+Examples:
+  # Basic usage
+  python transform_proxy.py --backend http://localhost:8080
+
+  # With sampling overrides (force specific values)
+  python transform_proxy.py --temperature 0.7 --repeat-penalty 1.0
+
+  # Just log what client sends, don't override
+  python transform_proxy.py --debug
+"""
+    )
+    
+    # Connection settings
+    parser.add_argument("--backend", "-b", default="http://localhost:8080",
+                        help="Backend llama.cpp server URL (default: http://localhost:8080)")
+    parser.add_argument("--port", "-p", type=int, default=4000,
+                        help="Port to listen on (default: 4000)")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="Host to bind to (default: 0.0.0.0)")
+    
+    # Transform settings
+    parser.add_argument("--no-transform", action="store_true",
+                        help="Disable transformation (passthrough mode)")
+    
+    # Sampling parameters (optional overrides)
+    sampling = parser.add_argument_group("sampling parameters (optional overrides)")
+    sampling.add_argument("--temperature", type=float, default=None,
+                          help="Override temperature (e.g., 0.7)")
+    sampling.add_argument("--top-p", type=float, default=None,
+                          help="Override top_p (e.g., 0.9)")
+    sampling.add_argument("--top-k", type=int, default=None,
+                          help="Override top_k (e.g., 40)")
+    sampling.add_argument("--min-p", type=float, default=None,
+                          help="Override min_p (e.g., 0.05)")
+    sampling.add_argument("--repeat-penalty", type=float, default=None,
+                          help="Override repeat_penalty (e.g., 1.0)")
+    sampling.add_argument("--presence-penalty", type=float, default=None,
+                          help="Override presence_penalty")
+    sampling.add_argument("--frequency-penalty", type=float, default=None,
+                          help="Override frequency_penalty")
+    
+    # Debug settings
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
+    parser.add_argument("--no-log-params", action="store_true",
+                        help="Disable logging of sampling parameters")
     
     args = parser.parse_args()
     
+    # Apply configuration
     config.backend_url = args.backend
     config.port = args.port
     config.host = args.host
     config.transform_enabled = not args.no_transform
     
+    # Sampling parameters
+    config.temperature = args.temperature
+    config.top_p = args.top_p
+    config.top_k = args.top_k
+    config.min_p = args.min_p
+    config.repeat_penalty = args.repeat_penalty
+    config.presence_penalty = args.presence_penalty
+    config.frequency_penalty = args.frequency_penalty
+    config.log_sampling_params = not args.no_log_params
+    
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Log startup configuration
     logger.info(f"Starting LLM Response Transformer Proxy")
     logger.info(f"  Backend: {config.backend_url}")
     logger.info(f"  Listening: {config.host}:{config.port}")
     logger.info(f"  Transform: {'enabled' if config.transform_enabled else 'disabled'}")
+    
+    # Log sampling overrides if any are set
+    overrides = []
+    if config.temperature is not None:
+        overrides.append(f"temperature={config.temperature}")
+    if config.top_p is not None:
+        overrides.append(f"top_p={config.top_p}")
+    if config.top_k is not None:
+        overrides.append(f"top_k={config.top_k}")
+    if config.min_p is not None:
+        overrides.append(f"min_p={config.min_p}")
+    if config.repeat_penalty is not None:
+        overrides.append(f"repeat_penalty={config.repeat_penalty}")
+    if config.presence_penalty is not None:
+        overrides.append(f"presence_penalty={config.presence_penalty}")
+    if config.frequency_penalty is not None:
+        overrides.append(f"frequency_penalty={config.frequency_penalty}")
+    
+    if overrides:
+        logger.info(f"  Sampling overrides: {', '.join(overrides)}")
+    else:
+        logger.info(f"  Sampling overrides: none (using client values)")
     
     import uvicorn
     uvicorn.run(app, host=config.host, port=config.port, log_level="info")
