@@ -609,8 +609,9 @@ async def collect_stream(
                 
                 if "choices" in chunk and chunk["choices"]:
                     delta = chunk["choices"][0].get("delta", {})
-                    if "content" in delta:
-                        full_content += delta["content"]
+                    content_piece = delta.get("content")
+                    if content_piece is not None:
+                        full_content += content_piece
                     if chunk["choices"][0].get("finish_reason"):
                         metadata["finish_reason"] = chunk["choices"][0]["finish_reason"]
                 
