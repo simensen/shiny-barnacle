@@ -636,8 +636,18 @@ async def handle_streaming_request(
     body["stream"] = True
     content, original_chunks, metadata = await collect_stream(client, body)
     
+    # Log what we collected for debugging
+    logger.info(f"Stream collected: {len(original_chunks)} chunks, {len(content)} chars content")
+    if content:
+        # Show first 200 chars to help debug
+        preview = content[:200].replace('\n', '\\n')
+        logger.info(f"Content preview: {preview}...")
+    
     # Check if transformation needed
-    if config.transform_enabled and ToolCallParser.has_malformed_tool_call(content):
+    has_malformed = config.transform_enabled and ToolCallParser.has_malformed_tool_call(content)
+    logger.info(f"Has malformed tool call: {has_malformed}")
+    
+    if has_malformed:
         logger.info("Detected malformed tool call in stream, transforming...")
         
         try:
@@ -653,23 +663,27 @@ async def handle_streaming_request(
                     await asyncio.sleep(0.005)  # Small delay for realistic streaming
                 
                 yield "data: [DONE]\n\n"
-                logger.info(f"Stream transformation successful")
+                logger.info(f"Stream transformation successful: {len(parsed.tool_calls)} tool call(s)")
                 stats.record_transformed()
                 return
+            else:
+                logger.info("Parser returned was_transformed=False, passing through")
+                stats.record_passthrough()
                 
         except Exception as e:
             logger.error(f"Stream transformation failed: {e}")
             stats.record_failed()
             # Fall through to replay original
     else:
-        # No transformation needed - model output was valid
+        # No transformation needed - model output was valid (or no tool calls)
         stats.record_passthrough()
-        logger.debug("Stream passthrough: no transformation needed")
+        logger.info("Stream passthrough: no malformed tool calls detected")
     
     # No transformation needed or failed - replay original chunks
     for chunk in original_chunks:
         yield f"data: {json.dumps(chunk)}\n\n"
     yield "data: [DONE]\n\n"
+    logger.info(f"Stream complete. Stats: total={stats.total_requests}, passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}")
 
 
 # =============================================================================
@@ -740,10 +754,18 @@ async def get_stats():
     """
     return {
         "proxy_stats": stats.to_dict(),
+        "raw_counts": {
+            "total": stats.total_requests,
+            "passthrough": stats.passthrough_requests,
+            "transformed": stats.transformed_requests,
+            "failed": stats.failed_transforms,
+            "backend_errors": stats.backend_errors
+        },
         "interpretation": {
             "passthrough": "Model output was already valid - proxy just passed it through",
             "transformed": "Model output was malformed - proxy fixed it",
-            "if_all_passthrough": "Great! The model is producing valid tool calls on its own"
+            "if_all_passthrough": "Great! The model is producing valid tool calls on its own",
+            "if_zero_total": "No requests recorded yet - check if requests are reaching the proxy"
         }
     }
 
