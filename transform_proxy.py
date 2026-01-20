@@ -128,16 +128,18 @@ def apply_sampling_params(body: dict) -> dict:
     Proxy params override client params when set.
     Returns the modified body and logs the effective params.
     """
-    # Collect what the client sent
-    client_params = {
-        "temperature": body.get("temperature"),
-        "top_p": body.get("top_p"),
-        "top_k": body.get("top_k"),
-        "min_p": body.get("min_p"),
-        "repeat_penalty": body.get("repeat_penalty"),
-        "presence_penalty": body.get("presence_penalty"),
-        "frequency_penalty": body.get("frequency_penalty"),
+    # All known sampling-related parameter names (OpenAI + llama.cpp extensions)
+    ALL_SAMPLING_PARAMS = {
+        "temperature", "top_p", "top_k", "min_p", 
+        "repeat_penalty", "presence_penalty", "frequency_penalty",
+        "mirostat", "mirostat_tau", "mirostat_eta",
+        "seed", "stop", "max_tokens", "n",
+        "typical_p", "tfs_z", "repeat_last_n",
+        "penalize_nl", "dry_multiplier", "dry_base",
     }
+    
+    # Collect ALL sampling params the client sent (not just ones we override)
+    client_params = {k: v for k, v in body.items() if k in ALL_SAMPLING_PARAMS and v is not None}
     
     # Apply proxy overrides
     overrides = {}
@@ -165,23 +167,24 @@ def apply_sampling_params(body: dict) -> dict:
     
     # Log the parameters
     if config.log_sampling_params:
-        # Filter out None values for cleaner logging
-        client_set = {k: v for k, v in client_params.items() if v is not None}
-        effective = {
-            "temperature": body.get("temperature"),
-            "top_p": body.get("top_p"),
-            "top_k": body.get("top_k"),
-            "min_p": body.get("min_p"),
-            "repeat_penalty": body.get("repeat_penalty"),
-            "presence_penalty": body.get("presence_penalty"),
-            "frequency_penalty": body.get("frequency_penalty"),
-        }
-        effective_set = {k: v for k, v in effective.items() if v is not None}
+        # Also log non-sampling keys for debugging (excluding huge fields)
+        skip_keys = ALL_SAMPLING_PARAMS | {"messages", "tools", "tool_choice", "functions"}
+        other_keys = {k: body.get(k) for k in body.keys() if k not in skip_keys}
         
         if overrides:
-            logger.info(f"Sampling params - Client: {client_set}, Proxy overrides: {overrides}, Effective: {effective_set}")
+            # Calculate effective values for params we care about
+            effective = {}
+            for param in ["temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty"]:
+                val = body.get(param)
+                if val is not None:
+                    effective[param] = val
+            logger.info(f"Sampling params - Client sent: {client_params}, Proxy overrides: {overrides}, Effective: {effective}")
         else:
-            logger.info(f"Sampling params - Client: {client_set} (no proxy overrides)")
+            logger.info(f"Sampling params - Client sent: {client_params} (no proxy overrides)")
+        
+        # Log other interesting body keys
+        if other_keys:
+            logger.debug(f"Other request params: {other_keys}")
     
     return body
 
