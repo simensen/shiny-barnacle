@@ -626,7 +626,6 @@ async def collect_stream(
 
 
 async def handle_streaming_request(
-    client: httpx.AsyncClient,
     body: dict
 ) -> AsyncGenerator[str, None]:
     """Handle streaming request with transformation."""
@@ -634,56 +633,59 @@ async def handle_streaming_request(
     logger.info("Processing streaming request")
     
     body["stream"] = True
-    content, original_chunks, metadata = await collect_stream(client, body)
     
-    # Log what we collected for debugging
-    logger.info(f"Stream collected: {len(original_chunks)} chunks, {len(content)} chars content")
-    if content:
-        # Show first 200 chars to help debug
-        preview = content[:200].replace('\n', '\\n')
-        logger.info(f"Content preview: {preview}...")
-    
-    # Check if transformation needed
-    has_malformed = config.transform_enabled and ToolCallParser.has_malformed_tool_call(content)
-    logger.info(f"Has malformed tool call: {has_malformed}")
-    
-    if has_malformed:
-        logger.info("Detected malformed tool call in stream, transforming...")
+    # Create client inside the generator so it stays open during iteration
+    async with httpx.AsyncClient() as client:
+        content, original_chunks, metadata = await collect_stream(client, body)
         
-        try:
-            parsed = ToolCallParser.parse(content)
-            if parsed.was_transformed:
-                # Generate transformed chunks
-                transformed_chunks = ResponseTransformer.transform_streaming_content(
-                    content, parsed, metadata
-                )
-                
-                for chunk in transformed_chunks:
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    await asyncio.sleep(0.005)  # Small delay for realistic streaming
-                
-                yield "data: [DONE]\n\n"
-                logger.info(f"Stream transformation successful: {len(parsed.tool_calls)} tool call(s)")
-                stats.record_transformed()
-                return
-            else:
-                logger.info("Parser returned was_transformed=False, passing through")
-                stats.record_passthrough()
-                
-        except Exception as e:
-            logger.error(f"Stream transformation failed: {e}")
-            stats.record_failed()
-            # Fall through to replay original
-    else:
-        # No transformation needed - model output was valid (or no tool calls)
-        stats.record_passthrough()
-        logger.info("Stream passthrough: no malformed tool calls detected")
-    
-    # No transformation needed or failed - replay original chunks
-    for chunk in original_chunks:
-        yield f"data: {json.dumps(chunk)}\n\n"
-    yield "data: [DONE]\n\n"
-    logger.info(f"Stream complete. Stats: total={stats.total_requests}, passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}")
+        # Log what we collected for debugging
+        logger.info(f"Stream collected: {len(original_chunks)} chunks, {len(content)} chars content")
+        if content:
+            # Show first 200 chars to help debug
+            preview = content[:200].replace('\n', '\\n')
+            logger.info(f"Content preview: {preview}...")
+        
+        # Check if transformation needed
+        has_malformed = config.transform_enabled and ToolCallParser.has_malformed_tool_call(content)
+        logger.info(f"Has malformed tool call: {has_malformed}")
+        
+        if has_malformed:
+            logger.info("Detected malformed tool call in stream, transforming...")
+            
+            try:
+                parsed = ToolCallParser.parse(content)
+                if parsed.was_transformed:
+                    # Generate transformed chunks
+                    transformed_chunks = ResponseTransformer.transform_streaming_content(
+                        content, parsed, metadata
+                    )
+                    
+                    for chunk in transformed_chunks:
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await asyncio.sleep(0.005)  # Small delay for realistic streaming
+                    
+                    yield "data: [DONE]\n\n"
+                    logger.info(f"Stream transformation successful: {len(parsed.tool_calls)} tool call(s)")
+                    stats.record_transformed()
+                    return
+                else:
+                    logger.info("Parser returned was_transformed=False, passing through")
+                    stats.record_passthrough()
+                    
+            except Exception as e:
+                logger.error(f"Stream transformation failed: {e}")
+                stats.record_failed()
+                # Fall through to replay original
+        else:
+            # No transformation needed - model output was valid (or no tool calls)
+            stats.record_passthrough()
+            logger.info("Stream passthrough: no malformed tool calls detected")
+        
+        # No transformation needed or failed - replay original chunks
+        for chunk in original_chunks:
+            yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+        logger.info(f"Stream complete. Stats: total={stats.total_requests}, passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}")
 
 
 # =============================================================================
@@ -699,18 +701,20 @@ async def chat_completions(request: Request):
     
     logger.info(f"Request: streaming={is_streaming}")
     
-    async with httpx.AsyncClient() as client:
-        if is_streaming:
-            return StreamingResponse(
-                handle_streaming_request(client, body),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                }
-            )
-        else:
+    if is_streaming:
+        # For streaming, the generator manages its own client lifecycle
+        return StreamingResponse(
+            handle_streaming_request(body),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+    else:
+        # For non-streaming, we can use context manager normally
+        async with httpx.AsyncClient() as client:
             result = await handle_non_streaming_request(client, body)
             return result
 
