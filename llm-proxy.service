@@ -1,0 +1,58 @@
+[Unit]
+Description=LLM Tool Call Transform Proxy
+Documentation=https://github.com/your-repo/llm-retry-proxy
+After=network.target
+# If llama-server is also a systemd service, uncomment:
+# After=network.target llama-server.service
+# Wants=llama-server.service
+
+[Service]
+Type=exec
+User=nobody
+Group=nogroup
+
+# Environment configuration
+Environment=LLM_PROXY_BACKEND=http://localhost:8080
+Environment=LLM_PROXY_PORT=4000
+Environment=LLM_PROXY_HOST=127.0.0.1
+
+# Optional: load from environment file
+# EnvironmentFile=/etc/llm-proxy/config
+
+# Working directory (adjust to your installation path)
+WorkingDirectory=/opt/llm-proxy
+
+# Run command - choose ONE of these options:
+
+# Option A: Direct Python (if installed via pip)
+ExecStart=/usr/bin/python3 transform_proxy.py --backend ${LLM_PROXY_BACKEND} --port ${LLM_PROXY_PORT} --host ${LLM_PROXY_HOST}
+
+# Option B: Using nix run (if using flake)
+# ExecStart=/usr/bin/env nix run .#transform -- --backend ${LLM_PROXY_BACKEND} --port ${LLM_PROXY_PORT} --host ${LLM_PROXY_HOST}
+
+# Option C: Multi-worker production (gunicorn)
+# ExecStart=/usr/bin/gunicorn transform_proxy:app -w 4 -k uvicorn.workers.UvicornWorker -b ${LLM_PROXY_HOST}:${LLM_PROXY_PORT}
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+# Resource limits (adjust as needed)
+MemoryMax=512M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target
