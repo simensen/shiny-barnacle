@@ -25,7 +25,7 @@ WorkingDirectory=/opt/toolbridge
 # Run command - choose ONE of these options:
 
 # Option A: Direct Python (if installed via pip)
-ExecStart=/usr/bin/python3 transform_proxy.py --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
+ExecStart=/usr/bin/python3 toolbridge.py --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
 
 # Option B: Using nix run (if using flake)
 # ExecStart=/usr/bin/env nix run .#transform -- --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}

@@ -53,7 +53,7 @@ nix develop
 direnv allow
 
 # Run the proxy
-python transform_proxy.py --backend http://localhost:8080 --port 4000
+python toolbridge.py --backend http://localhost:8080 --port 4000
 ```
 
 Or run directly without entering the shell:
@@ -70,7 +70,7 @@ nix run .#transform -- --backend http://localhost:8080 --port 4000
 pip install -r requirements.txt
 
 # Run the proxy
-python transform_proxy.py --backend http://localhost:8080 --port 4000
+python toolbridge.py --backend http://localhost:8080 --port 4000
 ```
 
 ### Then...
@@ -92,7 +92,7 @@ toolbridge/
 ├── .envrc                 # direnv configuration (auto-activates nix shell)
 ├── .gitignore
 ├── requirements.txt       # pip dependencies (alternative to nix)
-├── transform_proxy.py     # Parse & transform proxy
+├── toolbridge.py     # Parse & transform proxy
 ├── test_transform.py      # Test suite for transformation logic
 ├── toolbridge.service      # Systemd unit (system-wide)
 ├── toolbridge.user.service # Systemd unit (user-level, no root)
@@ -193,7 +193,7 @@ curl "http://localhost:4000/proxy/test-transform?content=<function=test><paramet
 The proxy uses Python's `asyncio` for concurrent request handling:
 
 ```bash
-python transform_proxy.py --port 4000
+python toolbridge.py --port 4000
 ```
 
 This handles multiple concurrent requests via async I/O. While one request waits for the llama.cpp backend, others can proceed. The transformation logic is fast (~microseconds) and won't bottleneck.
@@ -337,7 +337,7 @@ This proxy implements **buffer-and-replay** for streaming:
 ### Transform Proxy Command Line Options
 
 ```bash
-python transform_proxy.py [OPTIONS]
+python toolbridge.py [OPTIONS]
 
 Connection:
   --backend, -b URL     Backend llama.cpp server URL (default: http://localhost:8080)
@@ -365,10 +365,10 @@ When you specify a sampling parameter at the proxy level, it **overrides** whate
 
 ```bash
 # Force specific temperature and repeat_penalty for all requests
-python transform_proxy.py --temperature 0.7 --repeat-penalty 1.0
+python toolbridge.py --temperature 0.7 --repeat-penalty 1.0
 
 # Just observe what clients send (no overrides)
-python transform_proxy.py --debug
+python toolbridge.py --debug
 ```
 
 **Log output shows what's happening:**
@@ -397,13 +397,13 @@ curl -s http://localhost:4000/stats | jq '.sampling_overrides'
 
 ```bash
 # Basic usage - transform proxy
-python transform_proxy.py
+python toolbridge.py
 
 # Custom backend and port
-python transform_proxy.py --backend http://192.168.1.100:8080 --port 5000
+python toolbridge.py --backend http://192.168.1.100:8080 --port 5000
 
 # With sampling overrides
-python transform_proxy.py --temperature 0.7 --repeat-penalty 1.0 --top-p 0.9
+python toolbridge.py --temperature 0.7 --repeat-penalty 1.0 --top-p 0.9
 ```
 
 ---
@@ -601,7 +601,7 @@ For always-on servers or multi-user setups:
 ```bash
 # Install the proxy files
 sudo mkdir -p /opt/toolbridge
-sudo cp transform_proxy.py /opt/toolbridge/
+sudo cp toolbridge.py /opt/toolbridge/
 sudo cp requirements.txt /opt/toolbridge/
 
 # Install Python deps (or use nix)
@@ -689,7 +689,7 @@ python proxy.py --backend http://127.0.0.1:8080
 
 ### Still getting malformed responses
 
-1. Enable debug logging: `python transform_proxy.py --debug`
+1. Enable debug logging: `python toolbridge.py --debug`
 2. Check if your malformed pattern is being detected and transformed
 3. The proxy supports various malformed formats - check the logs to see what's being parsed
 

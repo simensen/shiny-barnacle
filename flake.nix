@@ -52,7 +52,7 @@
             echo "🚀 LLM Response Transformer Proxy Development Environment"
             echo ""
             echo "Available commands:"
-            echo "  python transform_proxy.py    - Start the transform proxy (recommended)"
+            echo "  python toolbridge.py    - Start the transform proxy (recommended)"
             echo "  python proxy.py              - Start the retry proxy"
             echo "  python test_transform.py     - Run transformation tests"
             echo ""
@@ -84,7 +84,7 @@
             # Create wrapper scripts
             cat > $out/bin/toolbridge-transform << EOF
             #!${pkgs.bash}/bin/bash
-            exec ${pythonEnv}/bin/python $out/lib/transform_proxy.py "\$@"
+            exec ${pythonEnv}/bin/python $out/lib/toolbridge.py "\$@"
             EOF
             chmod +x $out/bin/toolbridge-transform
 
