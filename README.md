@@ -1,17 +1,6 @@
-# LLM Retry Proxy
+# LLM Transform Proxy
 
-An OpenAI-compatible proxy that sits between your AI coding tools (bolt.diy, Cursor, Zed, etc.) and llama.cpp. It intercepts responses, detects malformed tool calls, and **transforms them into proper format** without expensive retries.
-
-## Two Approaches
-
-This project includes two proxy implementations:
-
-| File | Approach | Latency | Token Cost |
-|------|----------|---------|------------|
-| `transform_proxy.py` | **Parse & transform** malformed output | ~0ms | 0 extra |
-| `proxy.py` | Detect & **retry** with hints | 2-3x | 2-3x |
-
-**Recommendation:** Use `transform_proxy.py` - it's faster and cheaper.
+An OpenAI-compatible proxy that sits between your AI coding tools (bolt.diy, Cursor, Zed, etc.) and llama.cpp. It intercepts responses, detects malformed tool calls, and **transforms them into proper format**.
 
 ## The Problem This Solves
 
@@ -72,9 +61,6 @@ Or run directly without entering the shell:
 ```bash
 # Run transform proxy
 nix run .#transform -- --backend http://localhost:8080 --port 4000
-
-# Run retry proxy
-nix run .#retry -- --backend http://localhost:8080 --port 4000
 ```
 
 ### Option 2: Using pip
@@ -101,13 +87,12 @@ llama-server -m your-model.gguf -c 16384 --jinja --port 8080
 ## Project Structure
 
 ```
-llm-retry-proxy/
+llm-transform-proxy/
 ├── flake.nix              # Nix flake for reproducible environment
 ├── .envrc                 # direnv configuration (auto-activates nix shell)
 ├── .gitignore
 ├── requirements.txt       # pip dependencies (alternative to nix)
-├── transform_proxy.py     # ✅ Recommended: Parse & transform approach
-├── proxy.py               # Alternative: Detect & retry approach
+├── transform_proxy.py     # Parse & transform proxy
 ├── test_transform.py      # Test suite for transformation logic
 ├── llm-proxy.service      # Systemd unit (system-wide)
 ├── llm-proxy.user.service # Systemd unit (user-level, no root)
@@ -122,7 +107,6 @@ The `flake.nix` provides:
 |---------|-------------|
 | `nix develop` | Enter dev shell with Python + all deps |
 | `nix run .#transform` | Run transform proxy (single worker) |
-| `nix run .#retry` | Run retry proxy (single worker) |
 | `nix run .#production` | Run with gunicorn (4 workers default) |
 | `nix build` | Build the package |
 
@@ -250,39 +234,6 @@ In practice, llama.cpp is almost always the bottleneck. Multiple proxy workers o
 - llama.cpp has multiple slots (`-np 2` or higher)
 - You're running multiple llama.cpp instances
 - Transformation parsing becomes measurable (very large responses)
-
----
-
-## Transform vs Retry: When to Use Each
-
-### Transform Proxy (`transform_proxy.py`) ✅ Recommended
-
-**Use when:**
-- Model consistently produces the same malformed format
-- You want zero additional latency
-- You want to minimize token costs
-- The malformed output is structurally parseable
-
-**How it works:**
-```
-Request → Backend → Malformed Response → Parse → Transform → Client
-                                            ↓
-                                    (no retry needed)
-```
-
-### Retry Proxy (`proxy.py`)
-
-**Use when:**
-- Transformation fails (unparseable format)
-- You want the model to learn the correct format via prompting
-- Malformed patterns are inconsistent/unpredictable
-
-**How it works:**
-```
-Request → Backend → Malformed Response → Detect → Retry with hints → Client
-                                            ↓              ↓
-                                    (2-3x latency)  (2-3x tokens)
-```
 
 ---
 
@@ -442,20 +393,6 @@ curl -s http://localhost:4000/config | jq
 curl -s http://localhost:4000/stats | jq '.sampling_overrides'
 ```
 
-### Retry Proxy Command Line Options
-
-```bash
-python proxy.py [OPTIONS]
-
-Options:
-  --backend, -b URL     Backend llama.cpp server URL (default: http://localhost:8080)
-  --port, -p PORT       Port to listen on (default: 4000)
-  --host HOST           Host to bind to (default: 0.0.0.0)
-  --max-retries, -r N   Maximum retry attempts (default: 2)
-  --no-hints            Disable retry hint injection
-  --debug               Enable debug logging
-```
-
 ### Examples
 
 ```bash
@@ -467,9 +404,6 @@ python transform_proxy.py --backend http://192.168.1.100:8080 --port 5000
 
 # With sampling overrides
 python transform_proxy.py --temperature 0.7 --repeat-penalty 1.0 --top-p 0.9
-
-# Retry proxy with more retries
-python proxy.py --max-retries 3 --debug
 ```
 
 ---
@@ -547,25 +481,19 @@ curl http://localhost:4000/v1/chat/completions \
 │                         Your Machine                            │
 │                                                                 │
 │  ┌─────────────┐      ┌─────────────┐      ┌─────────────────┐ │
-│  │   Client    │      │   Retry     │      │   llama.cpp     │ │
+│  │   Client    │      │  Transform  │      │   llama.cpp     │ │
 │  │  (bolt.diy) │ ───▶ │   Proxy     │ ───▶ │    Server       │ │
 │  │             │      │  :4000      │      │    :8080        │ │
 │  └─────────────┘      └─────────────┘      └─────────────────┘ │
 │                              │                                  │
 │                              ▼                                  │
 │                     ┌───────────────┐                          │
-│                     │   Validate    │                          │
-│                     │   Response    │                          │
+│                     │    Parse &    │                          │
+│                     │   Transform   │                          │
 │                     └───────┬───────┘                          │
 │                             │                                  │
-│                    ┌────────┴────────┐                         │
-│                    │                 │                         │
-│                    ▼                 ▼                         │
-│               [Valid]          [Malformed]                     │
-│                  │                   │                         │
-│                  ▼                   ▼                         │
-│            Return to           Retry with                      │
-│             client              hints                          │
+│                             ▼                                  │
+│                      Return to client                          │
 │                                                                │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -584,35 +512,6 @@ curl http://localhost:4000/v1/chat/completions \
 
 ---
 
-## How Retry Logic Works
-
-### Detection
-
-The proxy looks for these malformed patterns:
-
-1. `<function=` or `<function name=` without `<tool_call>` wrapper
-2. `<function_call>` (wrong tag name)
-3. Raw JSON tool calls like `{"name": "...", "arguments": ...}` without wrapper
-
-### Retry Strategy
-
-1. **Attempt 1**: Normal request
-2. **Attempt 2** (if malformed):
-   - Add formatting reminder to system prompt
-   - Lower temperature by 0.1
-3. **Attempt 3** (if still malformed):
-   - Add explicit correction with snippet of failed output
-   - Lower temperature by 0.2 total
-4. **Give up**: Return last response (some response is better than none)
-
-### Why This Helps
-
-- **System prompt hints**: Remind model of correct format
-- **Lower temperature**: More deterministic output, more likely to follow format
-- **Showing the error**: On second retry, showing what went wrong helps model self-correct
-
----
-
 ## Monitoring
 
 ### Health Check
@@ -626,25 +525,18 @@ Response:
 {
   "status": "healthy",
   "backend_url": "http://localhost:8080",
-  "backend_healthy": true,
-  "config": {
-    "max_retries": 2,
-    "add_retry_hints": true
-  }
+  "backend_healthy": true
 }
 ```
 
 ### Logs
 
-The proxy logs all retry attempts:
+The proxy logs transformation activity:
 
 ```
 2026-01-20 10:30:15 - INFO - Received request: streaming=True, messages=5
-2026-01-20 10:30:15 - INFO - Stream attempt 1/3
-2026-01-20 10:30:18 - WARNING - Stream attempt 1: Malformed - Found malformed pattern '<function\s*=' without valid wrapper
-2026-01-20 10:30:18 - INFO - Retry 1: Adjusted temperature 0.7 -> 0.6
-2026-01-20 10:30:18 - INFO - Stream attempt 2/3
-2026-01-20 10:30:21 - INFO - Stream attempt 2: Valid, replaying to client
+2026-01-20 10:30:18 - INFO - Transformed malformed tool call to proper format
+2026-01-20 10:30:18 - INFO - Returning response to client
 ```
 
 ---
@@ -657,7 +549,7 @@ The proxy logs all retry attempts:
 |----------|-------------------|
 | Valid response, non-streaming | ~0ms (just passthrough) |
 | Valid response, streaming | Full generation time (buffer-and-replay) |
-| Retry needed | 2-3x generation time |
+| Transformation needed | ~0ms (parsing is fast) |
 
 ### Memory Usage
 
@@ -709,7 +601,7 @@ For always-on servers or multi-user setups:
 ```bash
 # Install the proxy files
 sudo mkdir -p /opt/llm-proxy
-sudo cp transform_proxy.py proxy.py /opt/llm-proxy/
+sudo cp transform_proxy.py /opt/llm-proxy/
 sudo cp requirements.txt /opt/llm-proxy/
 
 # Install Python deps (or use nix)
@@ -797,10 +689,9 @@ python proxy.py --backend http://127.0.0.1:8080
 
 ### Still getting malformed responses
 
-1. Enable debug logging: `python proxy.py --debug`
-2. Check if your malformed pattern is detected
-3. Add custom patterns to `ProxyConfig.malformed_patterns`
-4. Increase retries: `python proxy.py --max-retries 3`
+1. Enable debug logging: `python transform_proxy.py --debug`
+2. Check if your malformed pattern is being detected and transformed
+3. The proxy supports various malformed formats - check the logs to see what's being parsed
 
 ### High latency with streaming
 
@@ -813,20 +704,9 @@ This is expected with buffer-and-replay. Options:
 
 ## Extending the Proxy
 
-### Adding Custom Detection Patterns
-
-```python
-config.malformed_patterns.append(r'your-pattern-here')
-```
-
-### Custom Retry Logic
-
-Modify `augment_messages_for_retry()` to customize how messages are modified on retry.
-
 ### Metrics Collection
 
-The `/proxy/stats` endpoint is a placeholder. Implement counters for:
+The `/stats` endpoint provides counters for:
 - Total requests
-- Retry rate
-- Success rate by attempt number
+- Transformation count
 - Average latency
