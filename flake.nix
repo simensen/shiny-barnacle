@@ -10,24 +10,24 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        
+
         python = pkgs.python312;
-        
+
         pythonPackages = python.pkgs;
-        
+
         # Python dependencies
         pythonEnv = python.withPackages (ps: with ps; [
           # Core dependencies
           fastapi
           uvicorn
           httpx
-          
+
           # Optional: for development/testing
           pytest
           black
           ruff
           mypy
-          
+
           # Uvicorn extras for better performance
           uvloop
           httptools
@@ -38,11 +38,11 @@
       {
         # Development shell
         devShells.default = pkgs.mkShell {
-          name = "llm-proxy-dev";
-          
+          name = "toolbridge-dev";
+
           buildInputs = [
             pythonEnv
-            
+
             # Optional: useful CLI tools
             pkgs.curl
             pkgs.jq
@@ -63,38 +63,38 @@
 
           # Set Python to not write bytecode (cleaner dev experience)
           PYTHONDONTWRITEBYTECODE = "1";
-          
+
           # Ensure reproducible builds
           PYTHONHASHSEED = "0";
         };
 
         # Package the proxy as a runnable application
         packages.default = pkgs.stdenv.mkDerivation {
-          pname = "llm-proxy";
+          pname = "toolbridge";
           version = "0.1.0";
-          
+
           src = ./.;
-          
+
           buildInputs = [ pythonEnv ];
-          
+
           installPhase = ''
             mkdir -p $out/bin $out/lib
             cp *.py $out/lib/
-            
+
             # Create wrapper scripts
-            cat > $out/bin/llm-transform-proxy << EOF
+            cat > $out/bin/toolbridge-transform << EOF
             #!${pkgs.bash}/bin/bash
             exec ${pythonEnv}/bin/python $out/lib/transform_proxy.py "\$@"
             EOF
-            chmod +x $out/bin/llm-transform-proxy
-            
-            cat > $out/bin/llm-retry-proxy << EOF
+            chmod +x $out/bin/toolbridge-transform
+
+            cat > $out/bin/toolbridge-retry << EOF
             #!${pkgs.bash}/bin/bash
             exec ${pythonEnv}/bin/python $out/lib/proxy.py "\$@"
             EOF
-            chmod +x $out/bin/llm-retry-proxy
+            chmod +x $out/bin/toolbridge-retry
           '';
-          
+
           meta = with pkgs.lib; {
             description = "OpenAI-compatible proxy for LLM tool call transformation";
             license = licenses.mit;
@@ -105,15 +105,15 @@
         # Quick run commands
         apps = {
           default = self.apps.${system}.transform;
-          
+
           transform = {
             type = "app";
-            program = "${self.packages.${system}.default}/bin/llm-transform-proxy";
+            program = "${self.packages.${system}.default}/bin/toolbridge-transform";
           };
-          
+
           retry = {
             type = "app";
-            program = "${self.packages.${system}.default}/bin/llm-retry-proxy";
+            program = "${self.packages.${system}.default}/bin/toolbridge-retry";
           };
         };
       }

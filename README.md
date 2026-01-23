@@ -87,15 +87,15 @@ llama-server -m your-model.gguf -c 16384 --jinja --port 8080
 ## Project Structure
 
 ```
-llm-transform-proxy/
+toolbridge/
 ├── flake.nix              # Nix flake for reproducible environment
 ├── .envrc                 # direnv configuration (auto-activates nix shell)
 ├── .gitignore
 ├── requirements.txt       # pip dependencies (alternative to nix)
 ├── transform_proxy.py     # Parse & transform proxy
 ├── test_transform.py      # Test suite for transformation logic
-├── llm-proxy.service      # Systemd unit (system-wide)
-├── llm-proxy.user.service # Systemd unit (user-level, no root)
+├── toolbridge.service      # Systemd unit (system-wide)
+├── toolbridge.user.service # Systemd unit (user-level, no root)
 └── README.md
 ```
 
@@ -576,22 +576,22 @@ This runs the proxy as your user, starts on login:
 mkdir -p ~/.config/systemd/user
 
 # Copy the service file
-cp llm-proxy.user.service ~/.config/systemd/user/llm-proxy.service
+cp toolbridge.user.service ~/.config/systemd/user/toolbridge.service
 
 # Edit to match your setup (paths, backend URL, etc.)
-nano ~/.config/systemd/user/llm-proxy.service
+nano ~/.config/systemd/user/toolbridge.service
 
 # Reload systemd
 systemctl --user daemon-reload
 
 # Enable (start on login) and start
-systemctl --user enable --now llm-proxy
+systemctl --user enable --now toolbridge
 
 # Check status
-systemctl --user status llm-proxy
+systemctl --user status toolbridge
 
 # View logs
-journalctl --user -u llm-proxy -f
+journalctl --user -u toolbridge -f
 ```
 
 ### System Service (Runs as Dedicated User)
@@ -600,28 +600,28 @@ For always-on servers or multi-user setups:
 
 ```bash
 # Install the proxy files
-sudo mkdir -p /opt/llm-proxy
-sudo cp transform_proxy.py /opt/llm-proxy/
-sudo cp requirements.txt /opt/llm-proxy/
+sudo mkdir -p /opt/toolbridge
+sudo cp transform_proxy.py /opt/toolbridge/
+sudo cp requirements.txt /opt/toolbridge/
 
 # Install Python deps (or use nix)
-sudo pip install -r /opt/llm-proxy/requirements.txt
+sudo pip install -r /opt/toolbridge/requirements.txt
 
 # Install the service
-sudo cp llm-proxy.service /etc/systemd/system/
+sudo cp toolbridge.service /etc/systemd/system/
 
 # Edit configuration
-sudo nano /etc/systemd/system/llm-proxy.service
+sudo nano /etc/systemd/system/toolbridge.service
 
 # Reload, enable, start
 sudo systemctl daemon-reload
-sudo systemctl enable --now llm-proxy
+sudo systemctl enable --now toolbridge
 
 # Check status
-sudo systemctl status llm-proxy
+sudo systemctl status toolbridge
 
 # View logs
-sudo journalctl -u llm-proxy -f
+sudo journalctl -u toolbridge -f
 ```
 
 ### Systemd Environment Configuration
@@ -630,17 +630,17 @@ Edit the `Environment=` lines in the service file:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_PROXY_BACKEND` | `http://localhost:8080` | llama.cpp server URL |
-| `LLM_PROXY_PORT` | `4000` | Port to listen on |
-| `LLM_PROXY_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for all interfaces) |
+| `TOOLBRIDGE_BACKEND` | `http://localhost:8080` | llama.cpp server URL |
+| `TOOLBRIDGE_PORT` | `4000` | Port to listen on |
+| `TOOLBRIDGE_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for all interfaces) |
 
 Or use an environment file:
 
 ```bash
-# /etc/llm-proxy/config (system) or ~/.config/llm-proxy/config (user)
-LLM_PROXY_BACKEND=http://localhost:8080
-LLM_PROXY_PORT=4000
-LLM_PROXY_HOST=127.0.0.1
+# /etc/toolbridge/config (system) or ~/.config/toolbridge/config (user)
+TOOLBRIDGE_BACKEND=http://localhost:8080
+TOOLBRIDGE_PORT=4000
+TOOLBRIDGE_HOST=127.0.0.1
 ```
 
 Then uncomment `EnvironmentFile=` in the service file.
@@ -649,18 +649,18 @@ Then uncomment `EnvironmentFile=` in the service file.
 
 ```bash
 # User service
-systemctl --user start llm-proxy
-systemctl --user stop llm-proxy
-systemctl --user restart llm-proxy
-systemctl --user status llm-proxy
-journalctl --user -u llm-proxy -f
+systemctl --user start toolbridge
+systemctl --user stop toolbridge
+systemctl --user restart toolbridge
+systemctl --user status toolbridge
+journalctl --user -u toolbridge -f
 
 # System service (add sudo)
-sudo systemctl start llm-proxy
-sudo systemctl stop llm-proxy
-sudo systemctl restart llm-proxy
-sudo systemctl status llm-proxy
-sudo journalctl -u llm-proxy -f
+sudo systemctl start toolbridge
+sudo systemctl stop toolbridge
+sudo systemctl restart toolbridge
+sudo systemctl status toolbridge
+sudo journalctl -u toolbridge -f
 ```
 
 ---

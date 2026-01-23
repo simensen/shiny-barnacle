@@ -12,26 +12,26 @@ User=nobody
 Group=nogroup
 
 # Environment configuration
-Environment=LLM_PROXY_BACKEND=http://localhost:8080
-Environment=LLM_PROXY_PORT=4000
-Environment=LLM_PROXY_HOST=127.0.0.1
+Environment=TOOLBRIDGE_BACKEND=http://localhost:8080
+Environment=TOOLBRIDGE_PORT=4000
+Environment=TOOLBRIDGE_HOST=127.0.0.1
 
 # Optional: load from environment file
-# EnvironmentFile=/etc/llm-proxy/config
+# EnvironmentFile=/etc/toolbridge/config
 
 # Working directory (adjust to your installation path)
-WorkingDirectory=/opt/llm-proxy
+WorkingDirectory=/opt/toolbridge
 
 # Run command - choose ONE of these options:
 
 # Option A: Direct Python (if installed via pip)
-ExecStart=/usr/bin/python3 transform_proxy.py --backend ${LLM_PROXY_BACKEND} --port ${LLM_PROXY_PORT} --host ${LLM_PROXY_HOST}
+ExecStart=/usr/bin/python3 transform_proxy.py --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
 
 # Option B: Using nix run (if using flake)
-# ExecStart=/usr/bin/env nix run .#transform -- --backend ${LLM_PROXY_BACKEND} --port ${LLM_PROXY_PORT} --host ${LLM_PROXY_HOST}
+# ExecStart=/usr/bin/env nix run .#transform -- --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
 
 # Option C: Multi-worker production (gunicorn)
-# ExecStart=/usr/bin/gunicorn transform_proxy:app -w 4 -k uvicorn.workers.UvicornWorker -b ${LLM_PROXY_HOST}:${LLM_PROXY_PORT}
+# ExecStart=/usr/bin/gunicorn transform_proxy:app -w 4 -k uvicorn.workers.UvicornWorker -b ${TOOLBRIDGE_HOST}:${TOOLBRIDGE_PORT}
 
 # Restart policy
 Restart=on-failure

@@ -1,0 +1,31 @@
+[Unit]
+Description=LLM Tool Call Transform Proxy
+After=network.target
+
+[Service]
+Type=exec
+
+# Environment configuration
+Environment=TOOLBRIDGE_BACKEND=http://localhost:8080
+Environment=TOOLBRIDGE_PORT=4000
+Environment=TOOLBRIDGE_HOST=127.0.0.1
+
+# Working directory - adjust to where you cloned the repo
+WorkingDirectory=%h/toolbridge
+
+# Run command - choose ONE:
+
+# Option A: With nix-direnv (recommended if using flakes)
+ExecStart=/usr/bin/env -C %h/toolbridge bash -c 'eval "$(direnv export bash)" && python transform_proxy.py --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}'
+
+# Option B: Direct nix run
+# ExecStart=%h/.nix-profile/bin/nix run %h/toolbridge#transform -- --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
+
+# Option C: Direct Python (if deps installed globally or in venv)
+# ExecStart=/usr/bin/python3 %h/toolbridge/transform_proxy.py --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
