@@ -22,6 +22,7 @@ import logging
 import re
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional
 from xml.sax.saxutils import unescape as xml_unescape
@@ -100,6 +101,17 @@ stats = ProxyStats()
 
 
 @dataclass
+class ChatMessage:
+    """A single chat message for logging purposes"""
+
+    timestamp: float
+    direction: str  # "request" or "response"
+    role: str  # "user", "assistant", "system", "tool"
+    content: str  # Full message content
+    tool_calls: list[dict] | None = None  # If response contains tool calls
+
+
+@dataclass
 class SessionStats:
     """Track per-session statistics"""
 
@@ -110,6 +122,7 @@ class SessionStats:
     tool_calls_fixed: int = 0
     tool_calls_failed: int = 0
     client_ip: str | None = None
+    messages: deque = field(default_factory=deque)  # Circular buffer of ChatMessage
 
 
 class SessionTracker:
@@ -120,14 +133,16 @@ class SessionTracker:
     (first 2 messages: typically system prompt + first user message).
     """
 
-    def __init__(self, session_timeout: int = 3600):
+    def __init__(self, session_timeout: int = 3600, message_buffer_size: int = 1024):
         """
         Args:
             session_timeout: Seconds of inactivity before session expires (default 1 hour)
+            message_buffer_size: Max messages per session circular buffer (default 1024)
         """
         self._sessions: dict[str, SessionStats] = {}
         self._lock = asyncio.Lock()
         self.session_timeout = session_timeout
+        self.message_buffer_size = message_buffer_size
 
     def get_session_id(self, request: dict, client_ip: str | None = None) -> str:
         """
@@ -173,7 +188,10 @@ class SessionTracker:
 
         async with self._lock:
             if session_id not in self._sessions:
-                self._sessions[session_id] = SessionStats(client_ip=client_ip)
+                self._sessions[session_id] = SessionStats(
+                    client_ip=client_ip,
+                    messages=deque(maxlen=self.message_buffer_size),
+                )
 
             session_stats = self._sessions[session_id]
             session_stats.last_seen_at = time.time()
@@ -192,6 +210,36 @@ class SessionTracker:
         """Get stats for a specific session."""
         async with self._lock:
             return self._sessions.get(session_id)
+
+    async def add_message(
+        self,
+        session_id: str,
+        direction: str,
+        role: str,
+        content: str,
+        tool_calls: list[dict] | None = None,
+    ) -> None:
+        """
+        Add a chat message to a session's message buffer.
+
+        Args:
+            session_id: The session ID to add the message to
+            direction: "request" or "response"
+            role: Message role ("user", "assistant", "system", "tool")
+            content: The message content
+            tool_calls: Optional list of tool calls (for assistant responses)
+        """
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session:
+                message = ChatMessage(
+                    timestamp=time.time(),
+                    direction=direction,
+                    role=role,
+                    content=content,
+                    tool_calls=tool_calls,
+                )
+                session.messages.append(message)
 
     async def get_all_sessions(self) -> dict[str, SessionStats]:
         """Get all active sessions (excludes expired)."""
@@ -248,6 +296,10 @@ class ProxyConfig:
 
     # Debug settings
     log_sampling_params: bool = True  # Log sampling params for each request
+
+    # Message logging settings
+    log_messages: bool = True  # Enable message logging in sessions
+    message_buffer_size: int = 1024  # Max messages per session (circular buffer)
 
 
 config = ProxyConfig()
@@ -959,6 +1011,15 @@ async def handle_streaming_request(
                 tool_calls_fixed=0,
                 tool_calls_failed=0,
             )
+            # Log request messages if enabled (no response on error)
+            if config.log_messages:
+                for msg in body.get("messages", []):
+                    await session_tracker.add_message(
+                        session_id=session_id,
+                        direction="request",
+                        role=msg.get("role", "unknown"),
+                        content=msg.get("content", ""),
+                    )
             error_chunk = {
                 "error": {
                     "message": str(e),
@@ -980,6 +1041,15 @@ async def handle_streaming_request(
                 tool_calls_fixed=0,
                 tool_calls_failed=0,
             )
+            # Log request messages if enabled (no response on error)
+            if config.log_messages:
+                for msg in body.get("messages", []):
+                    await session_tracker.add_message(
+                        session_id=session_id,
+                        direction="request",
+                        role=msg.get("role", "unknown"),
+                        content=msg.get("content", ""),
+                    )
             error_chunk = {"error": {"message": str(e), "type": "proxy_error"}}
             yield f"data: {json.dumps(error_chunk)}\n\n"
             yield "data: [DONE]\n\n"
@@ -1039,6 +1109,35 @@ async def handle_streaming_request(
                         tool_calls_fixed=tool_calls_fixed,
                         tool_calls_failed=tool_calls_failed,
                     )
+
+                    # Log chat messages if enabled
+                    if config.log_messages:
+                        for msg in body.get("messages", []):
+                            await session_tracker.add_message(
+                                session_id=session_id,
+                                direction="request",
+                                role=msg.get("role", "unknown"),
+                                content=msg.get("content", ""),
+                            )
+                        # Log transformed response with tool calls
+                        tool_calls_data = [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": json.dumps(tc.arguments),
+                                },
+                            }
+                            for tc in parsed.tool_calls
+                        ]
+                        await session_tracker.add_message(
+                            session_id=session_id,
+                            direction="response",
+                            role="assistant",
+                            content=parsed.preamble or "",
+                            tool_calls=tool_calls_data,
+                        )
                     return
                 else:
                     logger.info(
@@ -1071,6 +1170,23 @@ async def handle_streaming_request(
             tool_calls_fixed=tool_calls_fixed,
             tool_calls_failed=tool_calls_failed,
         )
+
+        # Log chat messages if enabled
+        if config.log_messages:
+            for msg in body.get("messages", []):
+                await session_tracker.add_message(
+                    session_id=session_id,
+                    direction="request",
+                    role=msg.get("role", "unknown"),
+                    content=msg.get("content", ""),
+                )
+            # Log response (passthrough content)
+            await session_tracker.add_message(
+                session_id=session_id,
+                direction="response",
+                role="assistant",
+                content=content,
+            )
 
         logger.info(
             f"[{session_id}] Stream complete. Stats: total={stats.total_requests}, passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}"
@@ -1152,6 +1268,29 @@ async def chat_completions(request: Request):
                 tool_calls_fixed=request_result.tool_calls_fixed,
                 tool_calls_failed=request_result.tool_calls_failed,
             )
+
+            # Log chat messages if enabled
+            if config.log_messages:
+                # Log request messages
+                for msg in body.get("messages", []):
+                    await session_tracker.add_message(
+                        session_id=session_id,
+                        direction="request",
+                        role=msg.get("role", "unknown"),
+                        content=msg.get("content", ""),
+                    )
+
+                # Log response message
+                response_data = request_result.response
+                if "choices" in response_data and response_data["choices"]:
+                    response_msg = response_data["choices"][0].get("message", {})
+                    await session_tracker.add_message(
+                        session_id=session_id,
+                        direction="response",
+                        role=response_msg.get("role", "assistant"),
+                        content=response_msg.get("content", ""),
+                        tool_calls=response_msg.get("tool_calls"),
+                    )
 
             return request_result.response
 
@@ -1255,13 +1394,24 @@ async def get_sessions():
 
 
 @app.get("/admin/sessions/{session_id}")
-async def get_session(session_id: str):
-    """Get stats for a specific session."""
+async def get_session(
+    session_id: str,
+    include_messages: bool = True,
+    message_limit: int = 100,
+):
+    """
+    Get stats for a specific session.
+
+    Args:
+        session_id: The session ID to look up
+        include_messages: Whether to include chat messages (default: True)
+        message_limit: Maximum number of recent messages to return (default: 100)
+    """
     session_stats = await session_tracker.get_session_stats(session_id)
     if not session_stats:
         return {"error": "Session not found", "session_id": session_id}
 
-    return {
+    result = {
         "session_id": session_id,
         "created_at": session_stats.created_at,
         "last_seen_at": session_stats.last_seen_at,
@@ -1277,6 +1427,24 @@ async def get_session(session_id: str):
         "client_ip": session_stats.client_ip,
     }
 
+    if include_messages:
+        # Get the most recent messages (up to message_limit)
+        messages = list(session_stats.messages)[-message_limit:]
+        result["messages"] = [
+            {
+                "timestamp": msg.timestamp,
+                "direction": msg.direction,
+                "role": msg.role,
+                "content": msg.content,
+                "tool_calls": msg.tool_calls,
+            }
+            for msg in messages
+        ]
+        result["total_messages"] = len(session_stats.messages)
+        result["message_buffer_size"] = config.message_buffer_size
+
+    return result
+
 
 @app.get("/config")
 async def get_config():
@@ -1285,6 +1453,10 @@ async def get_config():
         "backend_url": config.backend_url,
         "transform_enabled": config.transform_enabled,
         "log_sampling_params": config.log_sampling_params,
+        "message_logging": {
+            "enabled": config.log_messages,
+            "buffer_size": config.message_buffer_size,
+        },
         "sampling_overrides": {
             "temperature": config.temperature,
             "top_p": config.top_p,
@@ -1468,6 +1640,19 @@ Examples:
         help="Disable logging of sampling parameters",
     )
 
+    # Message logging settings
+    parser.add_argument(
+        "--no-log-messages",
+        action="store_true",
+        help="Disable chat message logging in sessions",
+    )
+    parser.add_argument(
+        "--message-buffer-size",
+        type=int,
+        default=1024,
+        help="Max messages per session in circular buffer (default: 1024)",
+    )
+
     args = parser.parse_args()
 
     # Apply configuration
@@ -1486,6 +1671,17 @@ Examples:
     config.frequency_penalty = args.frequency_penalty
     config.log_sampling_params = not args.no_log_params
 
+    # Message logging settings
+    config.log_messages = not args.no_log_messages
+    config.message_buffer_size = args.message_buffer_size
+
+    # Reinitialize session tracker with new buffer size
+    global session_tracker
+    session_tracker = SessionTracker(
+        session_timeout=3600,
+        message_buffer_size=config.message_buffer_size,
+    )
+
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -1494,6 +1690,10 @@ Examples:
     logger.info(f"  Backend: {config.backend_url}")
     logger.info(f"  Listening: {config.host}:{config.port}")
     logger.info(f"  Transform: {'enabled' if config.transform_enabled else 'disabled'}")
+    if config.log_messages:
+        logger.info(f"  Message logging: enabled (buffer size: {config.message_buffer_size})")
+    else:
+        logger.info(f"  Message logging: disabled")
 
     # Log sampling overrides if any are set
     overrides = []
