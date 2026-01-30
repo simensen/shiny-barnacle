@@ -28,10 +28,10 @@ WorkingDirectory=/opt/toolbridge
 ExecStart=/usr/bin/python3 toolbridge.py --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
 
 # Option B: Using nix run (if using flake)
-# ExecStart=/usr/bin/env nix run .#transform -- --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
+# ExecStart=/usr/bin/env nix run .#toolbridge -- --backend ${TOOLBRIDGE_BACKEND} --port ${TOOLBRIDGE_PORT} --host ${TOOLBRIDGE_HOST}
 
 # Option C: Multi-worker production (gunicorn)
-# ExecStart=/usr/bin/gunicorn transform_proxy:app -w 4 -k uvicorn.workers.UvicornWorker -b ${TOOLBRIDGE_HOST}:${TOOLBRIDGE_PORT}
+# ExecStart=/usr/bin/gunicorn toolbridge:app -w 4 -k uvicorn.workers.UvicornWorker -b ${TOOLBRIDGE_HOST}:${TOOLBRIDGE_PORT}
 
 # Restart policy
 Restart=on-failure

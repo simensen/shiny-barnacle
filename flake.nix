@@ -52,9 +52,8 @@
             echo "🚀 LLM Response Transformer Proxy Development Environment"
             echo ""
             echo "Available commands:"
-            echo "  python toolbridge.py    - Start the transform proxy (recommended)"
-            echo "  python proxy.py              - Start the retry proxy"
-            echo "  python test_transform.py     - Run transformation tests"
+            echo "  python toolbridge.py    - Start the proxy"
+            echo "  pytest                  - Run tests"
             echo ""
             echo "Python: $(python --version)"
             echo "FastAPI, uvicorn, httpx ready"
@@ -81,18 +80,12 @@
             mkdir -p $out/bin $out/lib
             cp *.py $out/lib/
 
-            # Create wrapper scripts
-            cat > $out/bin/toolbridge-transform << EOF
+            # Create wrapper script
+            cat > $out/bin/toolbridge << EOF
             #!${pkgs.bash}/bin/bash
             exec ${pythonEnv}/bin/python $out/lib/toolbridge.py "\$@"
             EOF
-            chmod +x $out/bin/toolbridge-transform
-
-            cat > $out/bin/toolbridge-retry << EOF
-            #!${pkgs.bash}/bin/bash
-            exec ${pythonEnv}/bin/python $out/lib/proxy.py "\$@"
-            EOF
-            chmod +x $out/bin/toolbridge-retry
+            chmod +x $out/bin/toolbridge
           '';
 
           meta = with pkgs.lib; {
@@ -104,16 +97,11 @@
 
         # Quick run commands
         apps = {
-          default = self.apps.${system}.transform;
+          default = self.apps.${system}.toolbridge;
 
-          transform = {
+          toolbridge = {
             type = "app";
-            program = "${self.packages.${system}.default}/bin/toolbridge-transform";
-          };
-
-          retry = {
-            type = "app";
-            program = "${self.packages.${system}.default}/bin/toolbridge-retry";
+            program = "${self.packages.${system}.default}/bin/toolbridge";
           };
         };
       }
