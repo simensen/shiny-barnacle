@@ -175,16 +175,16 @@ class SessionTracker:
             if session_id not in self._sessions:
                 self._sessions[session_id] = SessionStats(client_ip=client_ip)
 
-            stats = self._sessions[session_id]
-            stats.last_seen_at = time.time()
-            stats.request_count += 1
-            stats.tool_calls_total += tool_calls_in_response
-            stats.tool_calls_fixed += tool_calls_fixed
-            stats.tool_calls_failed += tool_calls_failed
+            session_stats = self._sessions[session_id]
+            session_stats.last_seen_at = time.time()
+            session_stats.request_count += 1
+            session_stats.tool_calls_total += tool_calls_in_response
+            session_stats.tool_calls_fixed += tool_calls_fixed
+            session_stats.tool_calls_failed += tool_calls_failed
 
             # Update client IP if not set
-            if client_ip and not stats.client_ip:
-                stats.client_ip = client_ip
+            if client_ip and not session_stats.client_ip:
+                session_stats.client_ip = client_ip
 
         return session_id
 
@@ -1396,13 +1396,13 @@ Sampling Parameters:
 
 Examples:
   # Basic usage
-  python transform_proxy.py --backend http://localhost:8080
+  python toolbridge.py --backend http://localhost:8080
 
   # With sampling overrides (force specific values)
-  python transform_proxy.py --temperature 0.7 --repeat-penalty 1.0
+  python toolbridge.py --temperature 0.7 --repeat-penalty 1.0
 
   # Just log what client sends, don't override
-  python transform_proxy.py --debug
+  python toolbridge.py --debug
 """,
     )
 

@@ -59,8 +59,8 @@ python toolbridge.py --backend http://localhost:8080 --port 4000
 Or run directly without entering the shell:
 
 ```bash
-# Run transform proxy
-nix run .#transform -- --backend http://localhost:8080 --port 4000
+# Run the proxy
+nix run .#toolbridge -- --backend http://localhost:8080 --port 4000
 ```
 
 ### Option 2: Using pip
@@ -92,8 +92,7 @@ toolbridge/
 ├── .envrc                 # direnv configuration (auto-activates nix shell)
 ├── .gitignore
 ├── requirements.txt       # pip dependencies (alternative to nix)
-├── toolbridge.py     # Parse & transform proxy
-├── test_transform.py      # Test suite for transformation logic
+├── toolbridge.py          # Parse & transform proxy
 ├── toolbridge.service      # Systemd unit (system-wide)
 ├── toolbridge.user.service # Systemd unit (user-level, no root)
 └── README.md
@@ -106,14 +105,8 @@ The `flake.nix` provides:
 | Command | Description |
 |---------|-------------|
 | `nix develop` | Enter dev shell with Python + all deps |
-| `nix run .#transform` | Run transform proxy (single worker) |
-| `nix run .#production` | Run with gunicorn (4 workers default) |
+| `nix run .#toolbridge` | Run the proxy |
 | `nix build` | Build the package |
-
-Environment variables for production:
-```bash
-WORKERS=4 PORT=4000 HOST=0.0.0.0 nix run .#production
-```
 
 The dev shell includes:
 - Python 3.12
@@ -206,10 +199,10 @@ For multiple concurrent users or higher throughput:
 
 ```bash
 # Using uvicorn directly with multiple workers
-python -m uvicorn transform_proxy:app --workers 4 --host 0.0.0.0 --port 4000
+python -m uvicorn toolbridge:app --workers 4 --host 0.0.0.0 --port 4000
 
 # Or using gunicorn (more production-ready)
-gunicorn transform_proxy:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:4000
+gunicorn toolbridge:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:4000
 ```
 
 | Mode | Workers | Concurrent Requests | Use Case |
@@ -507,7 +500,7 @@ curl http://localhost:4000/v1/chat/completions \
 | `/v1/chat/completions` | POST | Main endpoint with retry logic |
 | `/v1/models` | GET | Proxied to backend |
 | `/health` | GET | Proxy health check |
-| `/proxy/stats` | GET | Proxy statistics |
+| `/stats` | GET | Proxy statistics |
 | `/*` | * | All other endpoints passed through |
 
 ---
@@ -674,7 +667,7 @@ sudo journalctl -u toolbridge -f
 lsof -i :4000
 
 # Try a different port
-python proxy.py --port 5000
+python toolbridge.py --port 5000
 ```
 
 ### Backend connection refused
@@ -684,7 +677,7 @@ python proxy.py --port 5000
 curl http://localhost:8080/health
 
 # Check backend URL
-python proxy.py --backend http://127.0.0.1:8080
+python toolbridge.py --backend http://127.0.0.1:8080
 ```
 
 ### Still getting malformed responses
