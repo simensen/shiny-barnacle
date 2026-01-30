@@ -1,6 +1,6 @@
 [Unit]
 Description=LLM Tool Call Transform Proxy
-Documentation=https://github.com/your-repo/llm-retry-proxy
+Documentation=https://github.com/simensen/shiny-barnacle
 After=network.target
 # If llama-server is also a systemd service, uncomment:
 # After=network.target llama-server.service

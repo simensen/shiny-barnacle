@@ -88,13 +88,15 @@ llama-server -m your-model.gguf -c 16384 --jinja --port 8080
 
 ```
 toolbridge/
-├── flake.nix              # Nix flake for reproducible environment
-├── .envrc                 # direnv configuration (auto-activates nix shell)
+├── flake.nix               # Nix flake for reproducible environment
+├── flake.lock              # Nix flake lock file
+├── .envrc                  # direnv configuration (auto-activates nix shell)
 ├── .gitignore
-├── requirements.txt       # pip dependencies (alternative to nix)
-├── toolbridge.py          # Parse & transform proxy
+├── requirements.txt        # pip dependencies (alternative to nix)
+├── toolbridge.py           # Parse & transform proxy
 ├── toolbridge.service      # Systemd unit (system-wide)
 ├── toolbridge.user.service # Systemd unit (user-level, no root)
+├── docs/                   # Documentation and implementation plans
 └── README.md
 ```
 
