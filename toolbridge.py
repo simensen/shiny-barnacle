@@ -917,14 +917,27 @@ async def handle_non_streaming_request(
     )
 
 
+@dataclass
+class StreamCollectionResult:
+    """Result from collecting a streaming response."""
+
+    content: str
+    chunks: list[dict]
+    metadata: dict
+    tool_calls: list[dict]  # Reconstructed tool calls from stream
+
+
 async def collect_stream(
     client: httpx.AsyncClient, body: dict
-) -> tuple[str, list[dict], dict]:
-    """Collect streaming response into content and chunks."""
+) -> StreamCollectionResult:
+    """Collect streaming response into content, chunks, and tool calls."""
 
     full_content = ""
     chunks = []
     metadata = {}
+    # Track tool calls being built from stream chunks
+    # Key: tool call index, Value: dict with id, type, function (name, arguments)
+    tool_calls_builder: dict[int, dict] = {}
 
     try:
         async with client.stream(
@@ -962,6 +975,32 @@ async def collect_stream(
                         content_piece = delta.get("content")
                         if content_piece is not None:
                             full_content += content_piece
+
+                        # Collect tool calls from stream
+                        delta_tool_calls = delta.get("tool_calls", [])
+                        for tc in delta_tool_calls:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_builder:
+                                tool_calls_builder[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "type": tc.get("type", "function"),
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            # Update with any new data
+                            if tc.get("id"):
+                                tool_calls_builder[idx]["id"] = tc["id"]
+                            if tc.get("type"):
+                                tool_calls_builder[idx]["type"] = tc["type"]
+                            func = tc.get("function", {})
+                            if func.get("name"):
+                                tool_calls_builder[idx]["function"]["name"] = func[
+                                    "name"
+                                ]
+                            if func.get("arguments"):
+                                tool_calls_builder[idx]["function"][
+                                    "arguments"
+                                ] += func["arguments"]
+
                         if chunk["choices"][0].get("finish_reason"):
                             metadata["finish_reason"] = chunk["choices"][0][
                                 "finish_reason"
@@ -978,7 +1017,15 @@ async def collect_stream(
         logger.error(f"HTTP error from backend: {e}")
         raise
 
-    return full_content, chunks, metadata
+    # Convert tool_calls_builder to sorted list
+    tool_calls = [tool_calls_builder[idx] for idx in sorted(tool_calls_builder.keys())]
+
+    return StreamCollectionResult(
+        content=full_content,
+        chunks=chunks,
+        metadata=metadata,
+        tool_calls=tool_calls,
+    )
 
 
 async def handle_streaming_request(
@@ -998,7 +1045,11 @@ async def handle_streaming_request(
     # Create client inside the generator so it stays open during iteration
     async with httpx.AsyncClient() as client:
         try:
-            content, original_chunks, metadata = await collect_stream(client, body)
+            stream_result = await collect_stream(client, body)
+            content = stream_result.content
+            original_chunks = stream_result.chunks
+            metadata = stream_result.metadata
+            stream_tool_calls = stream_result.tool_calls
         except httpx.HTTPStatusError as e:
             # Return error as SSE event
             logger.error(f"[{session_id}] Backend error during streaming: {e}")
@@ -1122,10 +1173,10 @@ async def handle_streaming_request(
                         # Log transformed response with tool calls
                         tool_calls_data = [
                             {
-                                "id": tc.id,
+                                "id": ResponseTransformer.generate_tool_call_id(),
                                 "type": "function",
                                 "function": {
-                                    "name": tc.name,
+                                    "name": tc.function_name,
                                     "arguments": json.dumps(tc.arguments),
                                 },
                             }
@@ -1152,9 +1203,11 @@ async def handle_streaming_request(
                 # Fall through to replay original
         else:
             # No transformation needed - model output was valid (or no tool calls)
+            # Count any tool calls that were already properly formatted in the stream
+            tool_calls_total = len(stream_tool_calls)
             stats.record_passthrough()
             logger.info(
-                f"[{session_id}] Stream passthrough: no malformed tool calls detected"
+                f"[{session_id}] Stream passthrough: no malformed tool calls detected, {tool_calls_total} valid tool call(s)"
             )
 
         # No transformation needed or failed - replay original chunks
@@ -1180,12 +1233,13 @@ async def handle_streaming_request(
                     role=msg.get("role", "unknown"),
                     content=msg.get("content", ""),
                 )
-            # Log response (passthrough content)
+            # Log response (passthrough content with any tool calls from stream)
             await session_tracker.add_message(
                 session_id=session_id,
                 direction="response",
                 role="assistant",
                 content=content,
+                tool_calls=stream_tool_calls if stream_tool_calls else None,
             )
 
         logger.info(
