@@ -29,7 +29,7 @@ from xml.sax.saxutils import unescape as xml_unescape
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # Configure logging
 logging.basicConfig(
@@ -1473,7 +1473,10 @@ async def get_session(
     """
     session_stats = await session_tracker.get_session_stats(session_id)
     if not session_stats:
-        return {"error": "Session not found", "session_id": session_id}
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Session not found", "session_id": session_id}
+        )
 
     result = {
         "session_id": session_id,
