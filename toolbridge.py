@@ -107,8 +107,9 @@ class ChatMessage:
     timestamp: float
     direction: str  # "request" or "response"
     role: str  # "user", "assistant", "system", "tool"
-    content: str  # Full message content
+    content: str  # Full message content (after transformation if any)
     tool_calls: list[dict] | None = None  # If response contains tool calls
+    raw_content: str | None = None  # Original content before transformation (if transformed)
 
 
 @dataclass
@@ -218,6 +219,7 @@ class SessionTracker:
         role: str,
         content: str,
         tool_calls: list[dict] | None = None,
+        raw_content: str | None = None,
     ) -> None:
         """
         Add a chat message to a session's message buffer.
@@ -226,8 +228,9 @@ class SessionTracker:
             session_id: The session ID to add the message to
             direction: "request" or "response"
             role: Message role ("user", "assistant", "system", "tool")
-            content: The message content
+            content: The message content (after transformation if any)
             tool_calls: Optional list of tool calls (for assistant responses)
+            raw_content: Original content before transformation (if transformed)
         """
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -238,6 +241,7 @@ class SessionTracker:
                     role=role,
                     content=content,
                     tool_calls=tool_calls,
+                    raw_content=raw_content,
                 )
                 session.messages.append(message)
 
@@ -850,6 +854,7 @@ class RequestResult:
     tool_calls_total: int = 0
     tool_calls_fixed: int = 0
     tool_calls_failed: int = 0
+    raw_content: str | None = None  # Original content before transformation (if transformed)
 
 
 async def handle_non_streaming_request(
@@ -875,6 +880,7 @@ async def handle_non_streaming_request(
     tool_calls_total = 0
     tool_calls_fixed = 0
     tool_calls_failed = 0
+    raw_content = None  # Will be set if transformation happens
 
     # Check if transformation is needed
     if config.transform_enabled and ToolCallParser.has_malformed_tool_call(content):
@@ -885,6 +891,7 @@ async def handle_non_streaming_request(
             tool_calls_total = len(parsed.tool_calls)
 
             if parsed.was_transformed:
+                raw_content = content  # Save original content before transformation
                 result = ResponseTransformer.transform_response(result, parsed)
                 tool_calls_fixed = len(parsed.tool_calls)
                 logger.info(
@@ -914,6 +921,7 @@ async def handle_non_streaming_request(
         tool_calls_total=tool_calls_total,
         tool_calls_fixed=tool_calls_fixed,
         tool_calls_failed=tool_calls_failed,
+        raw_content=raw_content,
     )
 
 
@@ -1188,6 +1196,7 @@ async def handle_streaming_request(
                             role="assistant",
                             content=parsed.preamble or "",
                             tool_calls=tool_calls_data,
+                            raw_content=content,  # Original content before transformation
                         )
                     return
                 else:
@@ -1344,6 +1353,7 @@ async def chat_completions(request: Request):
                         role=response_msg.get("role", "assistant"),
                         content=response_msg.get("content", ""),
                         tool_calls=response_msg.get("tool_calls"),
+                        raw_content=request_result.raw_content,  # Original content if transformed
                     )
 
             return request_result.response
@@ -1491,6 +1501,7 @@ async def get_session(
                 "role": msg.role,
                 "content": msg.content,
                 "tool_calls": msg.tool_calls,
+                "raw_content": msg.raw_content,  # Original content before transformation
             }
             for msg in messages
         ]
