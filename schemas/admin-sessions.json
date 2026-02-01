@@ -137,6 +137,10 @@
         "raw_content": {
           "type": ["string", "null"],
           "description": "Original content before transformation. Only present if the message was transformed by the proxy."
+        },
+        "debug": {
+          "type": ["object", "null"],
+          "description": "Original JSON payload (parsed). Contains the raw message data from the request or response."
         }
       },
       "required": ["timestamp", "direction", "role", "content"]
