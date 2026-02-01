@@ -23,14 +23,17 @@ import re
 import time
 import uuid
 from collections import deque
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Optional
+from typing import Any
 from xml.sax.saxutils import unescape as xml_unescape
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Configure logging
 logging.basicConfig(
@@ -315,45 +318,128 @@ class SessionTracker:
 session_tracker = SessionTracker(session_timeout=3600)
 
 
-@dataclass
-class ProxyConfig:
-    """Proxy configuration settings"""
+class ProxyConfig(BaseSettings):
+    """Proxy configuration settings.
 
-    backend_url: str = "http://localhost:8080"
-    port: int = 4000
-    host: str = "0.0.0.0"
+    Configuration can be set via:
+    1. CLI arguments (highest priority)
+    2. Environment variables (TOOLBRIDGE_<SETTING_NAME>)
+    3. .env file in the working directory
+    4. Default values (lowest priority)
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="TOOLBRIDGE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Connection settings
+    backend_url: str = Field(
+        default="http://localhost:8080",
+        description="Backend llama.cpp server URL",
+    )
+    port: int = Field(
+        default=4000,
+        description="Port to listen on",
+    )
+    host: str = Field(
+        default="0.0.0.0",
+        description="Host to bind to",
+    )
 
     # Transformation settings
-    transform_enabled: bool = True
-    fallback_to_retry: bool = True  # If transform fails, try retry
-    max_retries: int = 1  # Only used if transform fails
+    transform_enabled: bool = Field(
+        default=True,
+        description="Enable tool call transformation",
+    )
+    fallback_to_retry: bool = Field(
+        default=True,
+        description="If transform fails, try retry",
+    )
+    max_retries: int = Field(
+        default=1,
+        description="Max retries if transform fails",
+    )
 
     # Streaming settings
-    stream_buffer_timeout: float = 120.0
+    stream_buffer_timeout: float = Field(
+        default=120.0,
+        description="Timeout for streaming buffer in seconds",
+    )
 
     # Sampling parameters (None means use client's value or backend default)
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    min_p: float | None = None
-    repeat_penalty: float | None = None
-    presence_penalty: float | None = None
-    frequency_penalty: float | None = None
+    temperature: float | None = Field(
+        default=None,
+        description="Override temperature (e.g., 0.7)",
+    )
+    top_p: float | None = Field(
+        default=None,
+        description="Override top_p (e.g., 0.9)",
+    )
+    top_k: int | None = Field(
+        default=None,
+        description="Override top_k (e.g., 40)",
+    )
+    min_p: float | None = Field(
+        default=None,
+        description="Override min_p (e.g., 0.05)",
+    )
+    repeat_penalty: float | None = Field(
+        default=None,
+        description="Override repeat_penalty (e.g., 1.0)",
+    )
+    presence_penalty: float | None = Field(
+        default=None,
+        description="Override presence_penalty",
+    )
+    frequency_penalty: float | None = Field(
+        default=None,
+        description="Override frequency_penalty",
+    )
 
     # Debug settings
-    log_sampling_params: bool = True  # Log sampling params for each request
+    debug: bool = Field(
+        default=False,
+        description="Enable debug logging",
+    )
+    log_sampling_params: bool = Field(
+        default=True,
+        description="Log sampling params for each request",
+    )
 
     # Message logging settings
-    log_messages: bool = True  # Enable message logging in sessions
-    message_buffer_size: int = 1024  # Max messages per session (circular buffer)
+    log_messages: bool = Field(
+        default=True,
+        description="Enable message logging in sessions",
+    )
+    message_buffer_size: int = Field(
+        default=1024,
+        description="Max messages per session (circular buffer)",
+    )
 
     # CORS settings
-    cors_enabled: bool = False  # Enable CORS for admin endpoints
-    cors_origins: list[str] | None = None  # None = allow all ("*"), list = specific origins
-    cors_all_routes: bool = False  # Also enable CORS for /v1/* proxy routes
+    cors_enabled: bool = Field(
+        default=False,
+        description="Enable CORS for admin endpoints",
+    )
+    cors_origins: list[str] | None = Field(
+        default=None,
+        description="Allowed CORS origins (None = allow all '*')",
+    )
+    cors_all_routes: bool = Field(
+        default=False,
+        description="Enable CORS for ALL routes including /v1/* proxy endpoints",
+    )
 
 
-config = ProxyConfig()
+def load_config() -> ProxyConfig:
+    """Load configuration from environment variables and .env file."""
+    return ProxyConfig()
+
+
+config = load_config()
 app = FastAPI(title="LLM Response Transformer Proxy")
 
 
@@ -425,7 +511,7 @@ def apply_sampling_params(body: dict) -> dict:
             "tool_choice",
             "functions",
         }
-        other_keys = {k: body.get(k) for k in body.keys() if k not in skip_keys}
+        other_keys = {k: body.get(k) for k in body if k not in skip_keys}
 
         if overrides:
             # Calculate effective values for params we care about
@@ -1652,46 +1738,93 @@ async def passthrough(request: Request, path: str):
 # =============================================================================
 
 
-def main():
+def _env_help(env_var: str, description: str, default: str | None = None) -> str:
+    """Format help text with environment variable name."""
+    if default is not None:
+        return f"{description} [env: {env_var}, default: {default}]"
+    return f"{description} [env: {env_var}]"
+
+
+def main() -> None:
+    # Load config from environment variables / .env file first
+    global config
+    config = load_config()
+
     parser = argparse.ArgumentParser(
         description="LLM Response Transformer Proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Sampling Parameters:
-  When specified, these override whatever the client sends.
-  If not specified, client values pass through to backend.
+Configuration Priority (highest to lowest):
+  1. CLI arguments
+  2. Environment variables (TOOLBRIDGE_*)
+  3. .env file in working directory
+  4. Default values
+
+Environment Variables:
+  TOOLBRIDGE_BACKEND_URL       Backend server URL
+  TOOLBRIDGE_PORT              Port to listen on
+  TOOLBRIDGE_HOST              Host to bind to
+  TOOLBRIDGE_TRANSFORM_ENABLED Enable transformation (true/false)
+  TOOLBRIDGE_DEBUG             Enable debug logging (true/false)
+  TOOLBRIDGE_TEMPERATURE       Override temperature
+  TOOLBRIDGE_TOP_P             Override top_p
+  TOOLBRIDGE_TOP_K             Override top_k
+  TOOLBRIDGE_MIN_P             Override min_p
+  TOOLBRIDGE_REPEAT_PENALTY    Override repeat_penalty
+  TOOLBRIDGE_PRESENCE_PENALTY  Override presence_penalty
+  TOOLBRIDGE_FREQUENCY_PENALTY Override frequency_penalty
+  TOOLBRIDGE_LOG_SAMPLING_PARAMS  Log sampling params (true/false)
+  TOOLBRIDGE_LOG_MESSAGES      Enable message logging (true/false)
+  TOOLBRIDGE_MESSAGE_BUFFER_SIZE  Max messages per session
+  TOOLBRIDGE_CORS_ENABLED      Enable CORS (true/false)
+  TOOLBRIDGE_CORS_ORIGINS      Comma-separated allowed origins (as JSON list)
+  TOOLBRIDGE_CORS_ALL_ROUTES   Enable CORS for all routes (true/false)
 
 Examples:
-  # Basic usage
+  # Basic usage (reads from env vars / .env if available)
+  python toolbridge.py
+
+  # Override backend URL via CLI
   python toolbridge.py --backend http://localhost:8080
 
   # With sampling overrides (force specific values)
   python toolbridge.py --temperature 0.7 --repeat-penalty 1.0
 
-  # Just log what client sends, don't override
-  python toolbridge.py --debug
+  # Using environment variables
+  TOOLBRIDGE_BACKEND_URL=http://localhost:8080 python toolbridge.py
 """,
     )
 
-    # Connection settings
+    # Connection settings - use None as default to detect if CLI was used
     parser.add_argument(
         "--backend",
         "-b",
-        default="http://localhost:8080",
-        help="Backend llama.cpp server URL (default: http://localhost:8080)",
+        default=None,
+        help=_env_help(
+            "TOOLBRIDGE_BACKEND_URL",
+            "Backend llama.cpp server URL",
+            "http://localhost:8080",
+        ),
     )
     parser.add_argument(
-        "--port", "-p", type=int, default=4000, help="Port to listen on (default: 4000)"
+        "--port",
+        "-p",
+        type=int,
+        default=None,
+        help=_env_help("TOOLBRIDGE_PORT", "Port to listen on", "4000"),
     )
     parser.add_argument(
-        "--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)"
+        "--host",
+        default=None,
+        help=_env_help("TOOLBRIDGE_HOST", "Host to bind to", "0.0.0.0"),
     )
 
     # Transform settings
     parser.add_argument(
         "--no-transform",
         action="store_true",
-        help="Disable transformation (passthrough mode)",
+        help="Disable transformation (passthrough mode) "
+        "[env: TOOLBRIDGE_TRANSFORM_ENABLED=false]",
     )
 
     # Sampling parameters (optional overrides)
@@ -1700,52 +1833,74 @@ Examples:
         "--temperature",
         type=float,
         default=None,
-        help="Override temperature (e.g., 0.7)",
+        help=_env_help("TOOLBRIDGE_TEMPERATURE", "Override temperature (e.g., 0.7)"),
     )
     sampling.add_argument(
-        "--top-p", type=float, default=None, help="Override top_p (e.g., 0.9)"
+        "--top-p",
+        type=float,
+        default=None,
+        help=_env_help("TOOLBRIDGE_TOP_P", "Override top_p (e.g., 0.9)"),
     )
     sampling.add_argument(
-        "--top-k", type=int, default=None, help="Override top_k (e.g., 40)"
+        "--top-k",
+        type=int,
+        default=None,
+        help=_env_help("TOOLBRIDGE_TOP_K", "Override top_k (e.g., 40)"),
     )
     sampling.add_argument(
-        "--min-p", type=float, default=None, help="Override min_p (e.g., 0.05)"
+        "--min-p",
+        type=float,
+        default=None,
+        help=_env_help("TOOLBRIDGE_MIN_P", "Override min_p (e.g., 0.05)"),
     )
     sampling.add_argument(
         "--repeat-penalty",
         type=float,
         default=None,
-        help="Override repeat_penalty (e.g., 1.0)",
+        help=_env_help("TOOLBRIDGE_REPEAT_PENALTY", "Override repeat_penalty (e.g., 1.0)"),
     )
     sampling.add_argument(
-        "--presence-penalty", type=float, default=None, help="Override presence_penalty"
+        "--presence-penalty",
+        type=float,
+        default=None,
+        help=_env_help("TOOLBRIDGE_PRESENCE_PENALTY", "Override presence_penalty"),
     )
     sampling.add_argument(
         "--frequency-penalty",
         type=float,
         default=None,
-        help="Override frequency_penalty",
+        help=_env_help("TOOLBRIDGE_FREQUENCY_PENALTY", "Override frequency_penalty"),
     )
 
     # Debug settings
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging [env: TOOLBRIDGE_DEBUG=true]",
+    )
     parser.add_argument(
         "--no-log-params",
         action="store_true",
-        help="Disable logging of sampling parameters",
+        help="Disable logging of sampling parameters "
+        "[env: TOOLBRIDGE_LOG_SAMPLING_PARAMS=false]",
     )
 
     # Message logging settings
     parser.add_argument(
         "--no-log-messages",
         action="store_true",
-        help="Disable chat message logging in sessions",
+        help="Disable chat message logging in sessions "
+        "[env: TOOLBRIDGE_LOG_MESSAGES=false]",
     )
     parser.add_argument(
         "--message-buffer-size",
         type=int,
-        default=1024,
-        help="Max messages per session in circular buffer (default: 1024)",
+        default=None,
+        help=_env_help(
+            "TOOLBRIDGE_MESSAGE_BUFFER_SIZE",
+            "Max messages per session in circular buffer",
+            "1024",
+        ),
     )
 
     # CORS settings
@@ -1755,60 +1910,83 @@ Examples:
     cors_group.add_argument(
         "--cors",
         action="store_true",
-        help="Enable CORS for /admin/* endpoints (default: disabled)",
+        help="Enable CORS for /admin/* endpoints [env: TOOLBRIDGE_CORS_ENABLED=true]",
     )
     cors_group.add_argument(
         "--cors-origins",
         type=str,
         default=None,
         help="Comma-separated allowed origins (default: * if --cors enabled). "
-        'Example: --cors-origins "http://localhost:5173,https://admin.example.com"',
+        'Example: --cors-origins "http://localhost:5173,https://admin.example.com" '
+        "[env: TOOLBRIDGE_CORS_ORIGINS as JSON array]",
     )
     cors_group.add_argument(
         "--cors-all",
         action="store_true",
         help="Enable CORS for ALL routes including /v1/* proxy endpoints "
-        "(use with caution - exposes backend API to browsers)",
+        "(use with caution) [env: TOOLBRIDGE_CORS_ALL_ROUTES=true]",
     )
 
     args = parser.parse_args()
 
-    # Apply configuration
-    config.backend_url = args.backend
-    config.port = args.port
-    config.host = args.host
-    config.transform_enabled = not args.no_transform
+    # Apply CLI overrides - only if explicitly provided (not None)
+    # CLI takes precedence over environment variables
+    if args.backend is not None:
+        config.backend_url = args.backend
+    if args.port is not None:
+        config.port = args.port
+    if args.host is not None:
+        config.host = args.host
 
-    # Sampling parameters
-    config.temperature = args.temperature
-    config.top_p = args.top_p
-    config.top_k = args.top_k
-    config.min_p = args.min_p
-    config.repeat_penalty = args.repeat_penalty
-    config.presence_penalty = args.presence_penalty
-    config.frequency_penalty = args.frequency_penalty
-    config.log_sampling_params = not args.no_log_params
+    # Boolean flags - CLI flags override env vars when explicitly set
+    if args.no_transform:
+        config.transform_enabled = False
 
-    # Message logging settings
-    config.log_messages = not args.no_log_messages
-    config.message_buffer_size = args.message_buffer_size
+    # Sampling parameters - only override if CLI provided
+    if args.temperature is not None:
+        config.temperature = args.temperature
+    if args.top_p is not None:
+        config.top_p = args.top_p
+    if args.top_k is not None:
+        config.top_k = args.top_k
+    if args.min_p is not None:
+        config.min_p = args.min_p
+    if args.repeat_penalty is not None:
+        config.repeat_penalty = args.repeat_penalty
+    if args.presence_penalty is not None:
+        config.presence_penalty = args.presence_penalty
+    if args.frequency_penalty is not None:
+        config.frequency_penalty = args.frequency_penalty
 
-    # CORS settings
-    config.cors_enabled = args.cors or args.cors_all
-    config.cors_all_routes = args.cors_all
+    # Debug/logging settings
+    if args.no_log_params:
+        config.log_sampling_params = False
+    if args.no_log_messages:
+        config.log_messages = False
+    if args.message_buffer_size is not None:
+        config.message_buffer_size = args.message_buffer_size
+
+    # CORS settings - CLI flags override env vars
+    if args.cors or args.cors_all:
+        config.cors_enabled = True
+    if args.cors_all:
+        config.cors_all_routes = True
     if args.cors_origins:
         config.cors_origins = [o.strip() for o in args.cors_origins.split(",")]
-    else:
-        config.cors_origins = None  # Will use ["*"] when middleware is added
 
-    # Reinitialize session tracker with new buffer size
+    # Debug mode - can be set via CLI or env var
+    if args.debug:
+        config.debug = True
+
+    # Reinitialize session tracker with configured buffer size
     global session_tracker
     session_tracker = SessionTracker(
         session_timeout=3600,
         message_buffer_size=config.message_buffer_size,
     )
 
-    if args.debug:
+    # Apply debug logging level
+    if config.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
     # Setup CORS middleware if enabled
@@ -1861,14 +2039,14 @@ Examples:
             app.add_middleware(AdminOnlyCORSMiddleware)
 
     # Log startup configuration
-    logger.info(f"Starting LLM Response Transformer Proxy")
+    logger.info("Starting LLM Response Transformer Proxy")
     logger.info(f"  Backend: {config.backend_url}")
     logger.info(f"  Listening: {config.host}:{config.port}")
     logger.info(f"  Transform: {'enabled' if config.transform_enabled else 'disabled'}")
     if config.log_messages:
         logger.info(f"  Message logging: enabled (buffer size: {config.message_buffer_size})")
     else:
-        logger.info(f"  Message logging: disabled")
+        logger.info("  Message logging: disabled")
 
     # Log sampling overrides if any are set
     overrides = []
@@ -1890,7 +2068,7 @@ Examples:
     if overrides:
         logger.info(f"  Sampling overrides: {', '.join(overrides)}")
     else:
-        logger.info(f"  Sampling overrides: none (using client values)")
+        logger.info("  Sampling overrides: none (using client values)")
 
     # Log CORS configuration
     if config.cors_enabled:
@@ -1899,7 +2077,7 @@ Examples:
         logger.info(f"  CORS: enabled ({routes_scope})")
         logger.info(f"  CORS origins: {origins_display}")
     else:
-        logger.info(f"  CORS: disabled")
+        logger.info("  CORS: disabled")
 
     import uvicorn
 
