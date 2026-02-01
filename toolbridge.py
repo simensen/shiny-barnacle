@@ -114,6 +114,7 @@ class ChatMessage:
     content: str  # Full message content (after transformation if any)
     tool_calls: list[dict[str, Any]] | None = None  # If response contains tool calls
     raw_content: str | None = None  # Original content before transformation (if transformed)
+    debug: dict[str, Any] | None = None  # Original JSON payload (parsed)
 
 
 @dataclass
@@ -246,6 +247,7 @@ class SessionTracker:
         content: str,
         tool_calls: list[dict[str, Any]] | None = None,
         raw_content: str | None = None,
+        debug: dict[str, Any] | None = None,
     ) -> None:
         """
         Add a chat message to a session's message buffer.
@@ -257,6 +259,7 @@ class SessionTracker:
             content: The message content (after transformation if any)
             tool_calls: Optional list of tool calls (for assistant responses)
             raw_content: Original content before transformation (if transformed)
+            debug: Original JSON payload (parsed)
         """
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -268,6 +271,7 @@ class SessionTracker:
                     content=content,
                     tool_calls=tool_calls,
                     raw_content=raw_content,
+                    debug=debug,
                 )
                 session.messages.append(message)
 
@@ -305,6 +309,7 @@ class SessionTracker:
                     direction="request",
                     role=msg.get("role", "unknown"),
                     content=content,
+                    debug=msg,  # Original JSON payload
                 )
                 session.messages.append(message)
 
@@ -1376,6 +1381,7 @@ async def handle_streaming_request(
                             content=parsed.preamble or "",
                             tool_calls=tool_calls_data,
                             raw_content=content,  # Original content before transformation
+                            debug={"role": "assistant", "content": content},
                         )
                     return
                 else:
@@ -1422,12 +1428,16 @@ async def handle_streaming_request(
                 session_id, body.get("messages", [])
             )
             # Log response (passthrough content with any tool calls from stream)
+            debug_data: dict[str, Any] = {"role": "assistant", "content": content}
+            if stream_tool_calls:
+                debug_data["tool_calls"] = stream_tool_calls
             await session_tracker.add_message(
                 session_id=session_id,
                 direction="response",
                 role="assistant",
                 content=content,
                 tool_calls=stream_tool_calls if stream_tool_calls else None,
+                debug=debug_data,
             )
 
         logger.info(
@@ -1535,6 +1545,7 @@ async def chat_completions(request: Request) -> Response | dict[str, Any]:
                         content=response_msg.get("content", ""),
                         tool_calls=response_msg.get("tool_calls"),
                         raw_content=request_result.raw_content,  # Original content if transformed
+                        debug=response_msg,  # Original JSON payload
                     )
 
             logger.info(
@@ -1710,6 +1721,7 @@ async def get_session(
                 "content": msg.content,
                 "tool_calls": msg.tool_calls,
                 "raw_content": msg.raw_content,  # Original content before transformation
+                "debug": msg.debug,  # Original JSON payload
             }
             for msg in messages
         ]
