@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/simensen/toolbridge/schemas/admin-sessions.json",
+  "title": "Toolbridge Admin Sessions API",
+  "description": "JSON Schema for toolbridge admin session endpoints. Use this schema to validate API responses and generate TypeScript types for client applications.",
+
+  "$defs": {
+    "SessionSummary": {
+      "type": "object",
+      "description": "Summary statistics for a single session",
+      "properties": {
+        "created_at": {
+          "type": "number",
+          "description": "Unix timestamp (seconds) when the session was created"
+        },
+        "last_seen_at": {
+          "type": "number",
+          "description": "Unix timestamp (seconds) of last activity in the session"
+        },
+        "age_seconds": {
+          "type": "number",
+          "description": "Time in seconds since session creation"
+        },
+        "idle_seconds": {
+          "type": "number",
+          "description": "Time in seconds since last activity"
+        },
+        "request_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of requests processed in this session"
+        },
+        "tool_calls_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of tool calls processed"
+        },
+        "tool_calls_fixed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of tool calls that were transformed/fixed by the proxy"
+        },
+        "tool_calls_failed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of tool calls where transformation failed"
+        },
+        "fix_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Ratio of fixed to total tool calls (0.0 to 1.0). Returns 0 if no tool calls."
+        },
+        "client_ip": {
+          "type": ["string", "null"],
+          "description": "Client IP address if available (from X-Forwarded-For, X-Real-IP, or direct connection)"
+        }
+      },
+      "required": [
+        "created_at",
+        "last_seen_at",
+        "age_seconds",
+        "idle_seconds",
+        "request_count",
+        "tool_calls_total",
+        "tool_calls_fixed",
+        "tool_calls_failed",
+        "fix_rate"
+      ]
+    },
+
+    "ToolCallFunction": {
+      "type": "object",
+      "description": "The function details within a tool call",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name of the function being called"
+        },
+        "arguments": {
+          "type": "string",
+          "description": "JSON-encoded string of function arguments"
+        }
+      },
+      "required": ["name", "arguments"]
+    },
+
+    "ToolCall": {
+      "type": "object",
+      "description": "An OpenAI-format tool call (post-transformation)",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for this tool call (e.g., 'call_abc123')"
+        },
+        "type": {
+          "type": "string",
+          "const": "function",
+          "description": "Type of tool call (always 'function' for now)"
+        },
+        "function": {
+          "$ref": "#/$defs/ToolCallFunction"
+        }
+      },
+      "required": ["id", "type", "function"]
+    },
+
+    "ChatMessage": {
+      "type": "object",
+      "description": "A single message in the chat history",
+      "properties": {
+        "timestamp": {
+          "type": "number",
+          "description": "Unix timestamp (seconds) when the message was recorded"
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["request", "response"],
+          "description": "Whether this message was part of an incoming request or outgoing response"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "assistant", "system", "tool"],
+          "description": "The chat role of this message"
+        },
+        "content": {
+          "type": "string",
+          "description": "Message content (after transformation if applicable)"
+        },
+        "tool_calls": {
+          "type": ["array", "null"],
+          "items": {
+            "$ref": "#/$defs/ToolCall"
+          },
+          "description": "Tool calls if this is an assistant message containing tool invocations"
+        },
+        "raw_content": {
+          "type": ["string", "null"],
+          "description": "Original content before transformation. Only present if the message was transformed by the proxy."
+        }
+      },
+      "required": ["timestamp", "direction", "role", "content"]
+    },
+
+    "SessionListResponse": {
+      "type": "object",
+      "description": "Response from GET /admin/sessions - lists all active sessions",
+      "properties": {
+        "active_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of currently active sessions"
+        },
+        "session_timeout_seconds": {
+          "type": "integer",
+          "description": "Session timeout configuration in seconds (default: 3600)"
+        },
+        "sessions": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SessionSummary"
+          },
+          "description": "Map of session_id to session summary. Session IDs are either 'user_{value}' (if user field provided) or 16-character hex strings (hash-based)."
+        }
+      },
+      "required": ["active_sessions", "session_timeout_seconds", "sessions"]
+    },
+
+    "SessionDetailResponse": {
+      "type": "object",
+      "description": "Response from GET /admin/sessions/{session_id} - detailed session information with optional message history",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The session identifier"
+        },
+        "created_at": {
+          "type": "number",
+          "description": "Unix timestamp when session was created"
+        },
+        "last_seen_at": {
+          "type": "number",
+          "description": "Unix timestamp of last activity"
+        },
+        "age_seconds": {
+          "type": "number",
+          "description": "Time since session creation"
+        },
+        "idle_seconds": {
+          "type": "number",
+          "description": "Time since last activity"
+        },
+        "request_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total requests in this session"
+        },
+        "tool_calls_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total tool calls processed"
+        },
+        "tool_calls_fixed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tool calls that were transformed"
+        },
+        "tool_calls_failed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tool calls that failed transformation"
+        },
+        "fix_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Ratio of fixed to total tool calls"
+        },
+        "client_ip": {
+          "type": ["string", "null"],
+          "description": "Client IP address if available"
+        },
+        "message_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of messages currently in the buffer (may be less than total if buffer is circular)"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ChatMessage"
+          },
+          "description": "Message history. Only present if include_messages=true query parameter is set. Limited by message_limit parameter (default: 100)."
+        }
+      },
+      "required": [
+        "session_id",
+        "created_at",
+        "last_seen_at",
+        "age_seconds",
+        "idle_seconds",
+        "request_count",
+        "tool_calls_total",
+        "tool_calls_fixed",
+        "tool_calls_failed",
+        "fix_rate",
+        "message_count"
+      ]
+    },
+
+    "ErrorResponse": {
+      "type": "object",
+      "description": "Error response returned when a request fails",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "Human-readable error message"
+        },
+        "session_id": {
+          "type": "string",
+          "description": "The session ID that was requested (if applicable)"
+        }
+      },
+      "required": ["error"]
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/SessionListResponse" },
+    { "$ref": "#/$defs/SessionDetailResponse" },
+    { "$ref": "#/$defs/ErrorResponse" }
+  ]
+}

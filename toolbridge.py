@@ -29,6 +29,7 @@ from xml.sax.saxutils import unescape as xml_unescape
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # Configure logging
@@ -304,6 +305,11 @@ class ProxyConfig:
     # Message logging settings
     log_messages: bool = True  # Enable message logging in sessions
     message_buffer_size: int = 1024  # Max messages per session (circular buffer)
+
+    # CORS settings
+    cors_enabled: bool = False  # Enable CORS for admin endpoints
+    cors_origins: list[str] | None = None  # None = allow all ("*"), list = specific origins
+    cors_all_routes: bool = False  # Also enable CORS for /v1/* proxy routes
 
 
 config = ProxyConfig()
@@ -1721,6 +1727,29 @@ Examples:
         help="Max messages per session in circular buffer (default: 1024)",
     )
 
+    # CORS settings
+    cors_group = parser.add_argument_group(
+        "CORS settings (for admin API access from browsers)"
+    )
+    cors_group.add_argument(
+        "--cors",
+        action="store_true",
+        help="Enable CORS for /admin/* endpoints (default: disabled)",
+    )
+    cors_group.add_argument(
+        "--cors-origins",
+        type=str,
+        default=None,
+        help="Comma-separated allowed origins (default: * if --cors enabled). "
+        'Example: --cors-origins "http://localhost:5173,https://admin.example.com"',
+    )
+    cors_group.add_argument(
+        "--cors-all",
+        action="store_true",
+        help="Enable CORS for ALL routes including /v1/* proxy endpoints "
+        "(use with caution - exposes backend API to browsers)",
+    )
+
     args = parser.parse_args()
 
     # Apply configuration
@@ -1743,6 +1772,14 @@ Examples:
     config.log_messages = not args.no_log_messages
     config.message_buffer_size = args.message_buffer_size
 
+    # CORS settings
+    config.cors_enabled = args.cors or args.cors_all
+    config.cors_all_routes = args.cors_all
+    if args.cors_origins:
+        config.cors_origins = [o.strip() for o in args.cors_origins.split(",")]
+    else:
+        config.cors_origins = None  # Will use ["*"] when middleware is added
+
     # Reinitialize session tracker with new buffer size
     global session_tracker
     session_tracker = SessionTracker(
@@ -1752,6 +1789,55 @@ Examples:
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Setup CORS middleware if enabled
+    if config.cors_enabled:
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.responses import Response as StarletteResponse
+
+        origins = config.cors_origins if config.cors_origins else ["*"]
+
+        if config.cors_all_routes:
+            # CORS on all routes
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_credentials=True,
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["*"],
+            )
+        else:
+            # CORS only on /admin/* routes - use custom middleware
+            class AdminOnlyCORSMiddleware(BaseHTTPMiddleware):
+                async def dispatch(self, request: Request, call_next):
+                    # Only apply CORS to admin endpoints
+                    if not request.url.path.startswith("/admin"):
+                        return await call_next(request)
+
+                    # Handle preflight
+                    if request.method == "OPTIONS":
+                        origin = request.headers.get("origin", "")
+                        if "*" in origins or origin in origins:
+                            return StarletteResponse(
+                                status_code=204,
+                                headers={
+                                    "Access-Control-Allow-Origin": origin or "*",
+                                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                                    "Access-Control-Allow-Headers": "*",
+                                    "Access-Control-Allow-Credentials": "true",
+                                },
+                            )
+                        return await call_next(request)
+
+                    # Add CORS headers to response
+                    response = await call_next(request)
+                    origin = request.headers.get("origin", "")
+                    if "*" in origins or origin in origins:
+                        response.headers["Access-Control-Allow-Origin"] = origin or "*"
+                        response.headers["Access-Control-Allow-Credentials"] = "true"
+                    return response
+
+            app.add_middleware(AdminOnlyCORSMiddleware)
 
     # Log startup configuration
     logger.info(f"Starting LLM Response Transformer Proxy")
@@ -1784,6 +1870,15 @@ Examples:
         logger.info(f"  Sampling overrides: {', '.join(overrides)}")
     else:
         logger.info(f"  Sampling overrides: none (using client values)")
+
+    # Log CORS configuration
+    if config.cors_enabled:
+        origins_display = ", ".join(config.cors_origins) if config.cors_origins else "*"
+        routes_scope = "all routes" if config.cors_all_routes else "admin endpoints only"
+        logger.info(f"  CORS: enabled ({routes_scope})")
+        logger.info(f"  CORS origins: {origins_display}")
+    else:
+        logger.info(f"  CORS: disabled")
 
     import uvicorn
 
