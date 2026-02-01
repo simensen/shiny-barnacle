@@ -129,6 +129,14 @@ class SessionStats:
     client_ip: str | None = None
     messages: deque[ChatMessage] = field(default_factory=deque)  # Circular buffer of ChatMessage
     last_request_message_count: int = 0  # Track logged message count for deduplication
+    # Token usage - last request (shows current context window size)
+    last_prompt_tokens: int = 0
+    last_completion_tokens: int = 0
+    last_total_tokens: int = 0
+    # Token usage - cumulative (shows total session cost)
+    prompt_tokens_total: int = 0
+    completion_tokens_total: int = 0
+    total_tokens_total: int = 0
 
 
 class SessionTracker:
@@ -184,6 +192,9 @@ class SessionTracker:
         tool_calls_in_response: int = 0,
         tool_calls_fixed: int = 0,
         tool_calls_failed: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
     ) -> str:
         """
         Track a request and return its session ID.
@@ -205,6 +216,16 @@ class SessionTracker:
             session_stats.tool_calls_total += tool_calls_in_response
             session_stats.tool_calls_fixed += tool_calls_fixed
             session_stats.tool_calls_failed += tool_calls_failed
+
+            # Update token usage - last request values
+            session_stats.last_prompt_tokens = prompt_tokens
+            session_stats.last_completion_tokens = completion_tokens
+            session_stats.last_total_tokens = total_tokens
+
+            # Update token usage - cumulative totals
+            session_stats.prompt_tokens_total += prompt_tokens
+            session_stats.completion_tokens_total += completion_tokens
+            session_stats.total_tokens_total += total_tokens
 
             # Update client IP if not set
             if client_ip and not session_stats.client_ip:
@@ -986,6 +1007,10 @@ class RequestResult:
     tool_calls_fixed: int = 0
     tool_calls_failed: int = 0
     raw_content: str | None = None  # Original content before transformation (if transformed)
+    # Token usage from response
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 async def handle_non_streaming_request(
@@ -1048,12 +1073,21 @@ async def handle_non_streaming_request(
         stats.record_passthrough()
         logger.debug(f"[{session_id}] Passthrough: no transformation needed")
 
+    # Extract token usage from response
+    usage = result.get("usage", {})
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    total_tokens = usage.get("total_tokens", 0)
+
     return RequestResult(
         response=result,
         tool_calls_total=tool_calls_total,
         tool_calls_fixed=tool_calls_fixed,
         tool_calls_failed=tool_calls_failed,
         raw_content=raw_content,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
     )
 
 
@@ -1065,6 +1099,10 @@ class StreamCollectionResult:
     chunks: list[dict[str, Any]]
     metadata: dict[str, Any]
     tool_calls: list[dict[str, Any]]  # Reconstructed tool calls from stream
+    # Token usage (if backend supports stream_options.include_usage)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 async def collect_stream(
@@ -1078,6 +1116,10 @@ async def collect_stream(
     # Track tool calls being built from stream chunks
     # Key: tool call index, Value: dict with id, type, function (name, arguments)
     tool_calls_builder: dict[int, dict[str, Any]] = {}
+    # Token usage (captured from final chunk if backend supports it)
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
 
     try:
         async with client.stream(
@@ -1151,6 +1193,13 @@ async def collect_stream(
                     if "id" in chunk:
                         metadata["id"] = chunk["id"]
 
+                    # Capture usage if present (typically in final chunk)
+                    if "usage" in chunk:
+                        usage = chunk["usage"]
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
+                        total_tokens = usage.get("total_tokens", 0)
+
                 except json.JSONDecodeError:
                     continue
     except httpx.HTTPStatusError as e:
@@ -1165,6 +1214,9 @@ async def collect_stream(
         chunks=chunks,
         metadata=metadata,
         tool_calls=tool_calls,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
     )
 
 
@@ -1293,6 +1345,9 @@ async def handle_streaming_request(
                         tool_calls_in_response=tool_calls_total,
                         tool_calls_fixed=tool_calls_fixed,
                         tool_calls_failed=tool_calls_failed,
+                        prompt_tokens=stream_result.prompt_tokens,
+                        completion_tokens=stream_result.completion_tokens,
+                        total_tokens=stream_result.total_tokens,
                     )
 
                     # Log chat messages if enabled
@@ -1354,6 +1409,9 @@ async def handle_streaming_request(
             tool_calls_in_response=tool_calls_total,
             tool_calls_fixed=tool_calls_fixed,
             tool_calls_failed=tool_calls_failed,
+            prompt_tokens=stream_result.prompt_tokens,
+            completion_tokens=stream_result.completion_tokens,
+            total_tokens=stream_result.total_tokens,
         )
 
         # Log chat messages if enabled
@@ -1372,7 +1430,9 @@ async def handle_streaming_request(
 
         logger.info(
             f"[{session_id}] Stream complete. Stats: total={stats.total_requests}, "
-            f"passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}"
+            f"passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}, "
+            f"prompt_tokens={stream_result.prompt_tokens}, "
+            f"completion_tokens={stream_result.completion_tokens}"
         )
 
 
@@ -1450,6 +1510,9 @@ async def chat_completions(request: Request) -> Response | dict[str, Any]:
                 tool_calls_in_response=request_result.tool_calls_total,
                 tool_calls_fixed=request_result.tool_calls_fixed,
                 tool_calls_failed=request_result.tool_calls_failed,
+                prompt_tokens=request_result.prompt_tokens,
+                completion_tokens=request_result.completion_tokens,
+                total_tokens=request_result.total_tokens,
             )
 
             # Log chat messages if enabled
@@ -1471,6 +1534,14 @@ async def chat_completions(request: Request) -> Response | dict[str, Any]:
                         tool_calls=response_msg.get("tool_calls"),
                         raw_content=request_result.raw_content,  # Original content if transformed
                     )
+
+            logger.info(
+                f"[{session_id}] Request complete. Stats: "
+                f"total={stats.total_requests}, passthrough={stats.passthrough_requests}, "
+                f"transformed={stats.transformed_requests}, "
+                f"prompt_tokens={request_result.prompt_tokens}, "
+                f"completion_tokens={request_result.completion_tokens}"
+            )
 
             return request_result.response
 
@@ -1567,6 +1638,14 @@ async def get_sessions() -> dict[str, Any]:
                     3,
                 ),
                 "client_ip": session_stats.client_ip,
+                # Token usage - last request (shows current context window size)
+                "last_prompt_tokens": session_stats.last_prompt_tokens,
+                "last_completion_tokens": session_stats.last_completion_tokens,
+                "last_total_tokens": session_stats.last_total_tokens,
+                # Token usage - cumulative (shows total session cost)
+                "prompt_tokens_total": session_stats.prompt_tokens_total,
+                "completion_tokens_total": session_stats.completion_tokens_total,
+                "total_tokens_total": session_stats.total_tokens_total,
             }
             for sid, session_stats in sessions.items()
         },
@@ -1608,6 +1687,14 @@ async def get_session(
             session_stats.tool_calls_fixed / max(session_stats.tool_calls_total, 1), 3
         ),
         "client_ip": session_stats.client_ip,
+        # Token usage - last request (shows current context window size)
+        "last_prompt_tokens": session_stats.last_prompt_tokens,
+        "last_completion_tokens": session_stats.last_completion_tokens,
+        "last_total_tokens": session_stats.last_total_tokens,
+        # Token usage - cumulative (shows total session cost)
+        "prompt_tokens_total": session_stats.prompt_tokens_total,
+        "completion_tokens_total": session_stats.completion_tokens_total,
+        "total_tokens_total": session_stats.total_tokens_total,
     }
 
     if include_messages:
