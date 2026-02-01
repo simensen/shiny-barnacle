@@ -10,99 +10,58 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-
-        python = pkgs.python312;
-
-        pythonPackages = python.pkgs;
-
-        # Python dependencies
-        pythonEnv = python.withPackages (ps: with ps; [
-          # Core dependencies
-          fastapi
-          uvicorn
-          httpx
-
-          # Optional: for development/testing
-          pytest
-          black
-          ruff
-          mypy
-
-          # Uvicorn extras for better performance
-          uvloop
-          httptools
-          websockets
-        ]);
-
       in
       {
-        # Development shell
         devShells.default = pkgs.mkShell {
           name = "toolbridge-dev";
 
-          buildInputs = [
-            pythonEnv
-
-            # Optional: useful CLI tools
-            pkgs.curl
-            pkgs.jq
+          buildInputs = with pkgs; [
+            python312
+            uv
+            curl
+            jq
           ];
 
           shellHook = ''
-            echo "🚀 LLM Response Transformer Proxy Development Environment"
-            echo ""
-            echo "Available commands:"
-            echo "  python toolbridge.py    - Start the proxy"
-            echo "  pytest                  - Run tests"
-            echo ""
-            echo "Python: $(python --version)"
-            echo "FastAPI, uvicorn, httpx ready"
-            echo ""
+            export UV_PYTHON="python3.12"
+            export UV_PYTHON_PREFERENCE="only-system"
+            export UV_PROJECT_ENVIRONMENT=".direnv/.venv"
+            export UV_CACHE_DIR=".direnv/.cache/uv"
+
+            # Create virtual environment with uv if it doesn't exist
+            if [ ! -d "$UV_PROJECT_ENVIRONMENT" ]; then
+              echo "Creating virtual environment with uv..."
+              uv venv $UV_PROJECT_ENVIRONMENT
+            fi
+
+            # Activate virtual environment
+            source $UV_PROJECT_ENVIRONMENT/bin/activate
+
+            # Install dependencies from pyproject.toml if it exists
+            if [ -f "pyproject.toml" ]; then
+              echo "Installing dependencies from pyproject.toml with uv..."
+              uv pip install -e ".[dev]" 2>/dev/null || uv pip install -e .
+            fi
+
+            if [ -t 1 ]; then
+              echo ""
+              echo "Toolbridge Development Environment"
+              echo ""
+              echo "Python: $(python --version) ($(which python))"
+              echo "UV: $(uv --version)"
+              echo "Virtual environment: $VIRTUAL_ENV"
+              echo ""
+              echo "Quick start:"
+              echo "  make run        Run the proxy"
+              echo "  make test       Run tests"
+              echo "  make check      Run all checks"
+              echo "  make help       Show all commands"
+              echo ""
+            fi
           '';
 
-          # Set Python to not write bytecode (cleaner dev experience)
           PYTHONDONTWRITEBYTECODE = "1";
-
-          # Ensure reproducible builds
           PYTHONHASHSEED = "0";
-        };
-
-        # Package the proxy as a runnable application
-        packages.default = pkgs.stdenv.mkDerivation {
-          pname = "toolbridge";
-          version = "0.1.0";
-
-          src = ./.;
-
-          buildInputs = [ pythonEnv ];
-
-          installPhase = ''
-            mkdir -p $out/bin $out/lib
-            cp *.py $out/lib/
-
-            # Create wrapper script
-            cat > $out/bin/toolbridge << EOF
-            #!${pkgs.bash}/bin/bash
-            exec ${pythonEnv}/bin/python $out/lib/toolbridge.py "\$@"
-            EOF
-            chmod +x $out/bin/toolbridge
-          '';
-
-          meta = with pkgs.lib; {
-            description = "OpenAI-compatible proxy for LLM tool call transformation";
-            license = licenses.mit;
-            platforms = platforms.unix;
-          };
-        };
-
-        # Quick run commands
-        apps = {
-          default = self.apps.${system}.toolbridge;
-
-          toolbridge = {
-            type = "app";
-            program = "${self.packages.${system}.default}/bin/toolbridge";
-          };
         };
       }
     );
