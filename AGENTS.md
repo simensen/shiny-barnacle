@@ -5,9 +5,10 @@ LLM Response Transformer Proxy. Python 3.12+, FastAPI, async throughout.
 ## Critical Rules
 
 **Environment:**
-- ALWAYS run commands from the project directory, or use `direnv exec /path/to/project <command>`
+- ALWAYS run commands from the project directory
+- ALWAYS try commands failing because "command not found" again with the `./scripts/run.sh` (example: if `make check` fails because `python3` or the `uv` command was not found, try the command again as `./scripts/run.sh make check`)
 - NEVER modify Makefiles, scripts, or configs to fix "command not found" errors
-- NEVER try `python3`, `/usr/bin/python`, or search for interpreters—fix your environment
+- NEVER try `python3`, `/usr/bin/python`, or search for interpreters — fix your environment
 
 **Workflow:**
 - ALWAYS use `make` commands, not direct tool invocation
