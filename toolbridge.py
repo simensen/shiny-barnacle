@@ -56,23 +56,23 @@ class ProxyStats:
     failed_transforms: int = 0  # Transformation attempted but failed
     backend_errors: int = 0  # Backend returned error
 
-    def record_passthrough(self):
+    def record_passthrough(self) -> None:
         self.total_requests += 1
         self.passthrough_requests += 1
 
-    def record_transformed(self):
+    def record_transformed(self) -> None:
         self.total_requests += 1
         self.transformed_requests += 1
 
-    def record_failed(self):
+    def record_failed(self) -> None:
         self.total_requests += 1
         self.failed_transforms += 1
 
-    def record_backend_error(self):
+    def record_backend_error(self) -> None:
         self.total_requests += 1
         self.backend_errors += 1
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         total = self.total_requests or 1  # Avoid division by zero
         return {
             "total_requests": self.total_requests,
@@ -112,7 +112,7 @@ class ChatMessage:
     direction: str  # "request" or "response"
     role: str  # "user", "assistant", "system", "tool"
     content: str  # Full message content (after transformation if any)
-    tool_calls: list[dict] | None = None  # If response contains tool calls
+    tool_calls: list[dict[str, Any]] | None = None  # If response contains tool calls
     raw_content: str | None = None  # Original content before transformation (if transformed)
 
 
@@ -127,7 +127,7 @@ class SessionStats:
     tool_calls_fixed: int = 0
     tool_calls_failed: int = 0
     client_ip: str | None = None
-    messages: deque = field(default_factory=deque)  # Circular buffer of ChatMessage
+    messages: deque[ChatMessage] = field(default_factory=deque)  # Circular buffer of ChatMessage
     last_request_message_count: int = 0  # Track logged message count for deduplication
 
 
@@ -150,7 +150,7 @@ class SessionTracker:
         self.session_timeout = session_timeout
         self.message_buffer_size = message_buffer_size
 
-    def get_session_id(self, request: dict, client_ip: str | None = None) -> str:
+    def get_session_id(self, request: dict[str, Any], client_ip: str | None = None) -> str:
         """
         Generate a stable session ID from a chat completion request.
 
@@ -179,7 +179,7 @@ class SessionTracker:
 
     async def track_request(
         self,
-        request: dict,
+        request: dict[str, Any],
         client_ip: str | None = None,
         tool_calls_in_response: int = 0,
         tool_calls_fixed: int = 0,
@@ -223,7 +223,7 @@ class SessionTracker:
         direction: str,
         role: str,
         content: str,
-        tool_calls: list[dict] | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
         raw_content: str | None = None,
     ) -> None:
         """
@@ -253,7 +253,7 @@ class SessionTracker:
     async def add_request_messages(
         self,
         session_id: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
     ) -> None:
         """
         Add only NEW request messages to the buffer.
@@ -443,14 +443,14 @@ config = load_config()
 app = FastAPI(title="LLM Response Transformer Proxy")
 
 
-def apply_sampling_params(body: dict) -> dict:
+def apply_sampling_params(body: dict[str, Any]) -> dict[str, Any]:
     """Apply proxy-level sampling parameters to request body.
 
     Proxy params override client params when set.
     Returns the modified body and logs the effective params.
     """
     # All known sampling-related parameter names (OpenAI + llama.cpp extensions)
-    ALL_SAMPLING_PARAMS = {
+    all_sampling_params = {
         "temperature",
         "top_p",
         "top_k",
@@ -475,7 +475,7 @@ def apply_sampling_params(body: dict) -> dict:
 
     # Collect ALL sampling params the client sent (not just ones we override)
     client_params = {
-        k: v for k, v in body.items() if k in ALL_SAMPLING_PARAMS and v is not None
+        k: v for k, v in body.items() if k in all_sampling_params and v is not None
     }
 
     # Apply proxy overrides
@@ -505,7 +505,7 @@ def apply_sampling_params(body: dict) -> dict:
     # Log the parameters
     if config.log_sampling_params:
         # Also log non-sampling keys for debugging (excluding huge fields)
-        skip_keys = ALL_SAMPLING_PARAMS | {
+        skip_keys = all_sampling_params | {
             "messages",
             "tools",
             "tool_choice",
@@ -529,7 +529,8 @@ def apply_sampling_params(body: dict) -> dict:
                 if val is not None:
                     effective[param] = val
             logger.info(
-                f"Sampling params - Client sent: {client_params}, Proxy overrides: {overrides}, Effective: {effective}"
+                f"Sampling params - Client sent: {client_params}, "
+                f"Proxy overrides: {overrides}, Effective: {effective}"
             )
         else:
             logger.info(
@@ -553,7 +554,7 @@ class ParsedToolCall:
     """Represents a parsed tool call"""
 
     function_name: str
-    arguments: dict
+    arguments: dict[str, Any]
     raw_text: str  # Original text that was parsed
 
 
@@ -626,10 +627,7 @@ class ToolCallParser:
             return True
 
         # Has raw JSON tool calls
-        if cls.JSON_TOOL_CALL_PATTERN.search(content):
-            return True
-
-        return False
+        return bool(cls.JSON_TOOL_CALL_PATTERN.search(content))
 
     @classmethod
     def parse(cls, content: str) -> ParsedResponse:
@@ -704,7 +702,7 @@ class ToolCallParser:
         )
 
     @classmethod
-    def _parse_parameters(cls, body: str) -> dict:
+    def _parse_parameters(cls, body: str) -> dict[str, Any]:
         """Parse parameters from function body."""
         arguments = {}
 
@@ -723,7 +721,7 @@ class ToolCallParser:
         return arguments
 
     @classmethod
-    def _parse_json_tool_calls(cls, content: str, matches: list) -> ParsedResponse:
+    def _parse_json_tool_calls(cls, content: str, matches: list[re.Match[str]]) -> ParsedResponse:
         """Parse JSON-style tool calls."""
         tool_calls = []
 
@@ -800,8 +798,8 @@ class ResponseTransformer:
 
     @classmethod
     def transform_response(
-        cls, original_response: dict, parsed: ParsedResponse
-    ) -> dict:
+        cls, original_response: dict[str, Any], parsed: ParsedResponse
+    ) -> dict[str, Any]:
         """
         Transform a response with malformed tool calls into proper format.
 
@@ -815,7 +813,7 @@ class ResponseTransformer:
         if not parsed.was_transformed or not parsed.tool_calls:
             return original_response
 
-        response = json.loads(json.dumps(original_response))  # Deep copy
+        response: dict[str, Any] = json.loads(json.dumps(original_response))  # Deep copy
 
         if "choices" not in response or not response["choices"]:
             return original_response
@@ -862,8 +860,8 @@ class ResponseTransformer:
 
     @classmethod
     def transform_streaming_content(
-        cls, full_content: str, parsed: ParsedResponse, metadata: dict
-    ) -> list[dict]:
+        cls, full_content: str, parsed: ParsedResponse, metadata: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         """
         Transform streaming content into proper SSE chunks.
 
@@ -983,7 +981,7 @@ class ResponseTransformer:
 class RequestResult:
     """Result from processing a request, including session tracking stats."""
 
-    response: dict
+    response: dict[str, Any]
     tool_calls_total: int = 0
     tool_calls_fixed: int = 0
     tool_calls_failed: int = 0
@@ -991,7 +989,7 @@ class RequestResult:
 
 
 async def handle_non_streaming_request(
-    client: httpx.AsyncClient, body: dict, session_id: str
+    client: httpx.AsyncClient, body: dict[str, Any], session_id: str
 ) -> RequestResult:
     """Handle non-streaming request with transformation."""
 
@@ -1028,7 +1026,8 @@ async def handle_non_streaming_request(
                 result = ResponseTransformer.transform_response(result, parsed)
                 tool_calls_fixed = len(parsed.tool_calls)
                 logger.info(
-                    f"[{session_id}] Transformation successful: {len(parsed.tool_calls)} tool call(s)"
+                    f"[{session_id}] Transformation successful: "
+                    f"{len(parsed.tool_calls)} tool call(s)"
                 )
                 stats.record_transformed()
             else:
@@ -1063,13 +1062,13 @@ class StreamCollectionResult:
     """Result from collecting a streaming response."""
 
     content: str
-    chunks: list[dict]
-    metadata: dict
-    tool_calls: list[dict]  # Reconstructed tool calls from stream
+    chunks: list[dict[str, Any]]
+    metadata: dict[str, Any]
+    tool_calls: list[dict[str, Any]]  # Reconstructed tool calls from stream
 
 
 async def collect_stream(
-    client: httpx.AsyncClient, body: dict
+    client: httpx.AsyncClient, body: dict[str, Any]
 ) -> StreamCollectionResult:
     """Collect streaming response into content, chunks, and tool calls."""
 
@@ -1078,7 +1077,7 @@ async def collect_stream(
     metadata = {}
     # Track tool calls being built from stream chunks
     # Key: tool call index, Value: dict with id, type, function (name, arguments)
-    tool_calls_builder: dict[int, dict] = {}
+    tool_calls_builder: dict[int, dict[str, Any]] = {}
 
     try:
         async with client.stream(
@@ -1170,7 +1169,7 @@ async def collect_stream(
 
 
 async def handle_streaming_request(
-    body: dict, session_id: str, client_ip: str | None
+    body: dict[str, Any], session_id: str, client_ip: str | None
 ) -> AsyncGenerator[str, None]:
     """Handle streaming request with transformation."""
 
@@ -1241,7 +1240,8 @@ async def handle_streaming_request(
 
         # Log what we collected for debugging
         logger.info(
-            f"[{session_id}] Stream collected: {len(original_chunks)} chunks, {len(content)} chars content"
+            f"[{session_id}] Stream collected: {len(original_chunks)} chunks, "
+            f"{len(content)} chars content"
         )
         if content:
             # Show first 200 chars to help debug
@@ -1281,7 +1281,8 @@ async def handle_streaming_request(
 
                     yield "data: [DONE]\n\n"
                     logger.info(
-                        f"[{session_id}] Stream transformation successful: {len(parsed.tool_calls)} tool call(s)"
+                        f"[{session_id}] Stream transformation successful: "
+                        f"{len(parsed.tool_calls)} tool call(s)"
                     )
                     stats.record_transformed()
 
@@ -1337,7 +1338,8 @@ async def handle_streaming_request(
             tool_calls_total = len(stream_tool_calls)
             stats.record_passthrough()
             logger.info(
-                f"[{session_id}] Stream passthrough: no malformed tool calls detected, {tool_calls_total} valid tool call(s)"
+                f"[{session_id}] Stream passthrough: no malformed tool calls detected, "
+                f"{tool_calls_total} valid tool call(s)"
             )
 
         # No transformation needed or failed - replay original chunks
@@ -1369,7 +1371,8 @@ async def handle_streaming_request(
             )
 
         logger.info(
-            f"[{session_id}] Stream complete. Stats: total={stats.total_requests}, passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}"
+            f"[{session_id}] Stream complete. Stats: total={stats.total_requests}, "
+            f"passthrough={stats.passthrough_requests}, transformed={stats.transformed_requests}"
         )
 
 
@@ -1403,8 +1406,8 @@ def get_client_ip(request: Request) -> str | None:
     return None
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+@app.post("/v1/chat/completions", response_model=None)
+async def chat_completions(request: Request) -> Response | dict[str, Any]:
     """OpenAI-compatible chat completions with transformation."""
 
     body = await request.json()
@@ -1473,7 +1476,7 @@ async def chat_completions(request: Request):
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models() -> object:
     """Proxy models endpoint."""
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{config.backend_url}/v1/models")
@@ -1481,7 +1484,7 @@ async def list_models():
 
 
 @app.get("/health")
-async def health_check():
+async def health_check() -> dict[str, Any]:
     """Health check."""
     try:
         async with httpx.AsyncClient() as client:
@@ -1499,7 +1502,7 @@ async def health_check():
 
 
 @app.get("/stats")
-async def get_stats():
+async def get_stats() -> dict[str, Any]:
     """
     Get proxy statistics.
 
@@ -1537,7 +1540,7 @@ async def get_stats():
 
 
 @app.get("/admin/sessions")
-async def get_sessions():
+async def get_sessions() -> dict[str, Any]:
     """
     Return all active sessions and their stats.
 
@@ -1570,12 +1573,12 @@ async def get_sessions():
     }
 
 
-@app.get("/admin/sessions/{session_id}")
+@app.get("/admin/sessions/{session_id}", response_model=None)
 async def get_session(
     session_id: str,
     include_messages: bool = True,
     message_limit: int = 100,
-):
+) -> dict[str, Any] | JSONResponse:
     """
     Get stats for a specific session.
 
@@ -1628,7 +1631,7 @@ async def get_session(
 
 
 @app.get("/config")
-async def get_config():
+async def get_config() -> dict[str, Any]:
     """Get current proxy configuration."""
     return {
         "backend_url": config.backend_url,
@@ -1647,12 +1650,12 @@ async def get_config():
             "presence_penalty": config.presence_penalty,
             "frequency_penalty": config.frequency_penalty,
         },
-        "note": "Sampling overrides: null means client value passes through, set value overrides client",
+        "note": "Sampling overrides: null means client passes through, set value overrides",
     }
 
 
 @app.post("/stats/reset")
-async def reset_stats():
+async def reset_stats() -> dict[str, Any]:
     """Reset statistics counters."""
     global stats
     stats = ProxyStats()
@@ -1660,7 +1663,7 @@ async def reset_stats():
 
 
 @app.get("/proxy/test-transform")
-async def test_transform(content: str = ""):
+async def test_transform(content: str = "") -> dict[str, Any]:
     """
     Test the transformation logic.
 
@@ -1712,7 +1715,7 @@ async def test_transform(content: str = ""):
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def passthrough(request: Request, path: str):
+async def passthrough(request: Request, path: str) -> Response:
     """Pass through other endpoints unchanged."""
     async with httpx.AsyncClient() as client:
         url = f"{config.backend_url}/{path}"
@@ -1991,7 +1994,7 @@ Examples:
 
     # Setup CORS middleware if enabled
     if config.cors_enabled:
-        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
         from starlette.responses import Response as StarletteResponse
 
         origins = config.cors_origins if config.cors_origins else ["*"]
@@ -2008,7 +2011,9 @@ Examples:
         else:
             # CORS only on /admin/* routes - use custom middleware
             class AdminOnlyCORSMiddleware(BaseHTTPMiddleware):
-                async def dispatch(self, request: Request, call_next):
+                async def dispatch(
+                    self, request: Request, call_next: RequestResponseEndpoint
+                ) -> StarletteResponse:
                     # Only apply CORS to admin endpoints
                     if not request.url.path.startswith("/admin"):
                         return await call_next(request)
