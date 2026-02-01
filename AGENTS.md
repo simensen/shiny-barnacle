@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Event-driven bot. Python 3.11+, FastAPI, async throughout.
+LLM Response Transformer Proxy. Python 3.12+, FastAPI, async throughout.
 
 ## Critical Rules
 
