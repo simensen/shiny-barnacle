@@ -1228,6 +1228,8 @@ async def handle_streaming_request(
     logger.info(f"[{session_id}] Processing streaming request")
 
     body["stream"] = True
+    # Request usage information in streaming response (OpenAI-compatible APIs)
+    body["stream_options"] = {"include_usage": True}
 
     # Track tool call stats for session
     tool_calls_total = 0
