@@ -115,6 +115,7 @@ class ChatMessage:
     tool_calls: list[dict[str, Any]] | None = None  # If response contains tool calls
     raw_content: str | None = None  # Original content before transformation (if transformed)
     debug: dict[str, Any] | None = None  # Original JSON payload (parsed)
+    prompt_tokens: int | None = None  # Snapshot of prompt_tokens at time of logging
 
 
 @dataclass
@@ -248,6 +249,7 @@ class SessionTracker:
         tool_calls: list[dict[str, Any]] | None = None,
         raw_content: str | None = None,
         debug: dict[str, Any] | None = None,
+        prompt_tokens: int | None = None,
     ) -> None:
         """
         Add a chat message to a session's message buffer.
@@ -260,6 +262,7 @@ class SessionTracker:
             tool_calls: Optional list of tool calls (for assistant responses)
             raw_content: Original content before transformation (if transformed)
             debug: Original JSON payload (parsed)
+            prompt_tokens: Snapshot of prompt_tokens at time of logging (for context size tracking)
         """
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -272,6 +275,7 @@ class SessionTracker:
                     tool_calls=tool_calls,
                     raw_content=raw_content,
                     debug=debug,
+                    prompt_tokens=prompt_tokens,
                 )
                 session.messages.append(message)
 
@@ -279,6 +283,7 @@ class SessionTracker:
         self,
         session_id: str,
         messages: list[dict[str, Any]],
+        prompt_tokens: int | None = None,
     ) -> None:
         """
         Add only NEW request messages to the buffer.
@@ -290,6 +295,7 @@ class SessionTracker:
         Args:
             session_id: The session ID to add messages to
             messages: The full messages array from the request body
+            prompt_tokens: Snapshot of prompt_tokens at time of logging (for context size tracking)
         """
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -310,6 +316,7 @@ class SessionTracker:
                     role=msg.get("role", "unknown"),
                     content=content,
                     debug=msg,  # Original JSON payload
+                    prompt_tokens=prompt_tokens,  # Context size at this point in conversation
                 )
                 session.messages.append(message)
 
@@ -1261,10 +1268,10 @@ async def handle_streaming_request(
                 tool_calls_fixed=0,
                 tool_calls_failed=0,
             )
-            # Log request messages if enabled (no response on error)
+            # Log request messages if enabled (no response on error, no token count available)
             if config.log_messages:
                 await session_tracker.add_request_messages(
-                    session_id, body.get("messages", [])
+                    session_id, body.get("messages", []), prompt_tokens=None
                 )
             error_chunk = {
                 "error": {
@@ -1287,10 +1294,10 @@ async def handle_streaming_request(
                 tool_calls_fixed=0,
                 tool_calls_failed=0,
             )
-            # Log request messages if enabled (no response on error)
+            # Log request messages if enabled (no response on error, no token count available)
             if config.log_messages:
                 await session_tracker.add_request_messages(
-                    session_id, body.get("messages", [])
+                    session_id, body.get("messages", []), prompt_tokens=None
                 )
             error_chunk = {"error": {"message": str(e), "type": "proxy_error"}}
             yield f"data: {json.dumps(error_chunk)}\n\n"
@@ -1360,7 +1367,9 @@ async def handle_streaming_request(
                     # Log chat messages if enabled
                     if config.log_messages:
                         await session_tracker.add_request_messages(
-                            session_id, body.get("messages", [])
+                            session_id,
+                            body.get("messages", []),
+                            prompt_tokens=stream_result.prompt_tokens,
                         )
                         # Log transformed response with tool calls
                         tool_calls_data = [
@@ -1382,6 +1391,7 @@ async def handle_streaming_request(
                             tool_calls=tool_calls_data,
                             raw_content=content,  # Original content before transformation
                             debug={"role": "assistant", "content": content},
+                            prompt_tokens=stream_result.prompt_tokens,
                         )
                     return
                 else:
@@ -1425,7 +1435,9 @@ async def handle_streaming_request(
         # Log chat messages if enabled
         if config.log_messages:
             await session_tracker.add_request_messages(
-                session_id, body.get("messages", [])
+                session_id,
+                body.get("messages", []),
+                prompt_tokens=stream_result.prompt_tokens,
             )
             # Log response (passthrough content with any tool calls from stream)
             debug_data: dict[str, Any] = {"role": "assistant", "content": content}
@@ -1438,6 +1450,7 @@ async def handle_streaming_request(
                 content=content,
                 tool_calls=stream_tool_calls if stream_tool_calls else None,
                 debug=debug_data,
+                prompt_tokens=stream_result.prompt_tokens,
             )
 
         logger.info(
@@ -1531,7 +1544,9 @@ async def chat_completions(request: Request) -> Response | dict[str, Any]:
             if config.log_messages:
                 # Log request messages
                 await session_tracker.add_request_messages(
-                    session_id, body.get("messages", [])
+                    session_id,
+                    body.get("messages", []),
+                    prompt_tokens=request_result.prompt_tokens,
                 )
 
                 # Log response message
@@ -1546,6 +1561,7 @@ async def chat_completions(request: Request) -> Response | dict[str, Any]:
                         tool_calls=response_msg.get("tool_calls"),
                         raw_content=request_result.raw_content,  # Original content if transformed
                         debug=response_msg,  # Original JSON payload
+                        prompt_tokens=request_result.prompt_tokens,
                     )
 
             logger.info(
@@ -1722,6 +1738,7 @@ async def get_session(
                 "tool_calls": msg.tool_calls,
                 "raw_content": msg.raw_content,  # Original content before transformation
                 "debug": msg.debug,  # Original JSON payload
+                "prompt_tokens": msg.prompt_tokens,  # Context size at this point
             }
             for msg in messages
         ]
