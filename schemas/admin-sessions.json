@@ -54,6 +54,36 @@
         "client_ip": {
           "type": ["string", "null"],
           "description": "Client IP address if available (from X-Forwarded-For, X-Real-IP, or direct connection)"
+        },
+        "last_prompt_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Prompt tokens from the most recent request (current context window size)"
+        },
+        "last_completion_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Completion tokens from the most recent request"
+        },
+        "last_total_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Total tokens from the most recent request"
+        },
+        "prompt_tokens_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Cumulative prompt tokens across all requests in this session"
+        },
+        "completion_tokens_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Cumulative completion tokens across all requests in this session"
+        },
+        "total_tokens_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Cumulative total tokens across all requests in this session"
         }
       },
       "required": [
@@ -141,6 +171,10 @@
         "debug": {
           "type": ["object", "null"],
           "description": "Original JSON payload (parsed). Contains the raw message data from the request or response."
+        },
+        "prompt_tokens": {
+          "type": ["integer", "null"],
+          "description": "Snapshot of prompt_tokens at time of logging. Shows context size at this point."
         }
       },
       "required": ["timestamp", "direction", "role", "content"]
@@ -224,10 +258,45 @@
           "type": ["string", "null"],
           "description": "Client IP address if available"
         },
-        "message_count": {
+        "last_prompt_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Prompt tokens from the most recent request (current context window size)"
+        },
+        "last_completion_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Completion tokens from the most recent request"
+        },
+        "last_total_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Total tokens from the most recent request"
+        },
+        "prompt_tokens_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Cumulative prompt tokens across all requests in this session"
+        },
+        "completion_tokens_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Cumulative completion tokens across all requests in this session"
+        },
+        "total_tokens_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Cumulative total tokens across all requests in this session"
+        },
+        "total_messages": {
           "type": "integer",
           "minimum": 0,
-          "description": "Number of messages currently in the buffer (may be less than total if buffer is circular)"
+          "description": "Total number of messages in the buffer. Only present if include_messages=true."
+        },
+        "message_buffer_size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Configured message buffer size limit. Only present if include_messages=true."
         },
         "messages": {
           "type": "array",
@@ -247,8 +316,7 @@
         "tool_calls_total",
         "tool_calls_fixed",
         "tool_calls_failed",
-        "fix_rate",
-        "message_count"
+        "fix_rate"
       ]
     },
 

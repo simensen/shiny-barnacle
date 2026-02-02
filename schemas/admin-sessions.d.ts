@@ -45,6 +45,15 @@ export interface ChatMessage {
   tool_calls?: ToolCall[] | null;
   /** Original content before transformation. Only present if the message was transformed. */
   raw_content?: string | null;
+  /** Original JSON payload (parsed). Contains the raw message data from the request or response. */
+  debug?: Record<string, unknown> | null;
+  /**
+   * Snapshot of prompt_tokens at the time this message was logged.
+   * Represents the total context size including this message.
+   * Calculate deltas between consecutive messages to see per-message token cost.
+   * The first message's prompt_tokens reveals hidden overhead (system prompt, tools, template).
+   */
+  prompt_tokens?: number | null;
 }
 
 /**
@@ -71,6 +80,18 @@ export interface SessionSummary {
   fix_rate: number;
   /** Client IP address if available */
   client_ip: string | null;
+  /** Prompt tokens from the most recent request (current context window size) */
+  last_prompt_tokens: number | null;
+  /** Completion tokens from the most recent request */
+  last_completion_tokens: number | null;
+  /** Total tokens from the most recent request */
+  last_total_tokens: number | null;
+  /** Cumulative prompt tokens across all requests in this session */
+  prompt_tokens_total: number | null;
+  /** Cumulative completion tokens across all requests in this session */
+  completion_tokens_total: number | null;
+  /** Cumulative total tokens across all requests in this session */
+  total_tokens_total: number | null;
 }
 
 /**
@@ -112,8 +133,22 @@ export interface SessionDetailResponse {
   fix_rate: number;
   /** Client IP address if available */
   client_ip: string | null;
-  /** Number of messages currently in the buffer */
-  message_count: number;
+  /** Prompt tokens from the most recent request (current context window size) */
+  last_prompt_tokens: number | null;
+  /** Completion tokens from the most recent request */
+  last_completion_tokens: number | null;
+  /** Total tokens from the most recent request */
+  last_total_tokens: number | null;
+  /** Cumulative prompt tokens across all requests in this session */
+  prompt_tokens_total: number | null;
+  /** Cumulative completion tokens across all requests in this session */
+  completion_tokens_total: number | null;
+  /** Cumulative total tokens across all requests in this session */
+  total_tokens_total: number | null;
+  /** Total number of messages in the buffer (only if include_messages=true) */
+  total_messages?: number;
+  /** Configured message buffer size limit (only if include_messages=true) */
+  message_buffer_size?: number;
   /** Message history (only if include_messages=true) */
   messages?: ChatMessage[];
 }
@@ -132,7 +167,7 @@ export interface ErrorResponse {
  * Query parameters for GET /admin/sessions/{session_id}
  */
 export interface SessionDetailParams {
-  /** Include message history in response (default: false) */
+  /** Include message history in response (default: true) */
   include_messages?: boolean;
   /** Maximum number of messages to return (default: 100) */
   message_limit?: number;
