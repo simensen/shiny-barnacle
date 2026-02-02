@@ -715,6 +715,12 @@ class ProxyConfig(BaseSettings):
         description="Max messages per session (circular buffer)",
     )
 
+    # Session settings
+    session_timeout_seconds: int = Field(
+        default=3600,
+        description="Seconds of inactivity before session expires (default: 3600 = 1 hour)",
+    )
+
     # CORS settings
     cors_enabled: bool = Field(
         default=False,
@@ -2473,6 +2479,16 @@ Examples:
             "1024",
         ),
     )
+    parser.add_argument(
+        "--session-timeout",
+        type=int,
+        default=None,
+        help=_env_help(
+            "TOOLBRIDGE_SESSION_TIMEOUT_SECONDS",
+            "Seconds of inactivity before session expires",
+            "3600",
+        ),
+    )
 
     # CORS settings
     cors_group = parser.add_argument_group(
@@ -2582,6 +2598,8 @@ Examples:
         config.log_messages = False
     if args.message_buffer_size is not None:
         config.message_buffer_size = args.message_buffer_size
+    if args.session_timeout is not None:
+        config.session_timeout_seconds = args.session_timeout
 
     # CORS settings - CLI flags override env vars
     if args.cors or args.cors_all:
@@ -2621,7 +2639,7 @@ Examples:
     # Reinitialize session tracker with configured buffer size and archive
     global session_tracker
     session_tracker = SessionTracker(
-        session_timeout=3600,
+        session_timeout=config.session_timeout_seconds,
         message_buffer_size=config.message_buffer_size,
         archive=session_archive,
         archive_on_change=config.archive_on_change and config.archive_enabled,
@@ -2692,6 +2710,7 @@ Examples:
         logger.info(f"  Message logging: enabled (buffer size: {config.message_buffer_size})")
     else:
         logger.info("  Message logging: disabled")
+    logger.info(f"  Session timeout: {config.session_timeout_seconds} seconds")
 
     # Log sampling overrides if any are set
     overrides = []
