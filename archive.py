@@ -706,5 +706,6 @@ def session_stats_to_archive_dict(
         "total_tokens_total": stats.total_tokens_total,
         "detected_agent": stats.detected_agent,
         "detected_agent_confidence": stats.detected_agent_confidence,
+        "secondary_fingerprint": stats.secondary_fingerprint,
         "messages": messages,
     }

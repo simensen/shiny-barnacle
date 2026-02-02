@@ -323,6 +323,7 @@ class TestSessionStatsToArchiveDict:
             messages: deque
             detected_agent: str | None
             detected_agent_confidence: str | None
+            secondary_fingerprint: str | None
 
         stats = MockSessionStats(
             created_at=1000.0,
@@ -352,6 +353,7 @@ class TestSessionStatsToArchiveDict:
             ]),
             detected_agent="Cline",
             detected_agent_confidence="high",
+            secondary_fingerprint="abc123def456",
         )
 
         result = session_stats_to_archive_dict("session123", stats)
@@ -807,3 +809,434 @@ class TestDebouncedArchiving:
 
         # Should not mark as dirty when archive_on_change is False
         assert tracker.get_dirty_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_tokens_preserve_previous_values(self) -> None:
+        """Test that zero token values don't overwrite valid previous values.
+
+        When the API returns 0/null tokens (e.g., during context compression),
+        the session should preserve its previous token values rather than
+        zeroing them out.
+        """
+        from toolbridge import SessionTracker
+
+        tracker = SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=None,
+            archive_on_change=False,
+        )
+
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+
+        # First request with valid token values
+        session_id = await tracker.track_request(
+            request,
+            client_ip="127.0.0.1",
+            prompt_tokens=1000,
+            completion_tokens=200,
+            total_tokens=1200,
+        )
+
+        stats = await tracker.get_session_stats(session_id)
+        assert stats is not None
+        assert stats.last_prompt_tokens == 1000
+        assert stats.last_completion_tokens == 200
+        assert stats.last_total_tokens == 1200
+
+        # Second request with zero tokens (simulates context compression or API error)
+        await tracker.track_request(
+            request,
+            client_ip="127.0.0.1",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+        )
+
+        # Verify previous values are preserved
+        stats = await tracker.get_session_stats(session_id)
+        assert stats is not None
+        assert stats.last_prompt_tokens == 1000  # Should NOT be 0
+        assert stats.last_completion_tokens == 200  # Should NOT be 0
+        assert stats.last_total_tokens == 1200  # Should NOT be 0
+
+        # But request count should still increment
+        assert stats.request_count == 2
+
+        # Third request with new valid values should update
+        await tracker.track_request(
+            request,
+            client_ip="127.0.0.1",
+            prompt_tokens=2000,
+            completion_tokens=300,
+            total_tokens=2300,
+        )
+
+        stats = await tracker.get_session_stats(session_id)
+        assert stats is not None
+        assert stats.last_prompt_tokens == 2000
+        assert stats.last_completion_tokens == 300
+        assert stats.last_total_tokens == 2300
+        assert stats.request_count == 3
+
+
+class TestContinuationDetection:
+    """Tests for context continuation detection in session ID generation."""
+
+    @pytest.fixture
+    def tracker(self) -> "SessionTracker":
+        """Create a SessionTracker for testing."""
+        from toolbridge import SessionTracker
+
+        return SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=None,
+            archive_on_change=False,
+        )
+
+    def test_is_continuation_message_cline_pattern(self) -> None:
+        """Test detection of Cline's continuation marker."""
+        from toolbridge import is_continuation_message
+
+        # Exact Cline pattern
+        assert is_continuation_message("[Continue assisting the user!]") is True
+        # Without exclamation
+        assert is_continuation_message("[Continue assisting the user]") is True
+        # With extra content after
+        assert is_continuation_message("[Continue assisting the user!] More text") is True
+        # Leading whitespace
+        assert is_continuation_message("  [Continue assisting the user!]") is True
+
+    def test_is_continuation_message_multimodal_content(self) -> None:
+        """Test continuation detection with multimodal content format."""
+        from toolbridge import is_continuation_message
+
+        # Cline sends content as list of blocks
+        content = [
+            {"type": "text", "text": "[Continue assisting the user!]"},
+            {"type": "text", "text": "More instructions"},
+        ]
+        assert is_continuation_message(content) is True
+
+    def test_is_continuation_message_not_continuation(self) -> None:
+        """Test that normal messages are not detected as continuations."""
+        from toolbridge import is_continuation_message
+
+        assert is_continuation_message("Hello, please help me") is False
+        assert is_continuation_message("Continue the task") is False  # No brackets
+        assert is_continuation_message("") is False
+        assert is_continuation_message([]) is False
+
+    def test_compressed_sessions_have_consistent_ids(self, tracker: "SessionTracker") -> None:
+        """Test that multiple compressed sessions with same system prompt get same ID.
+
+        When Cline compresses context multiple times, each compressed session
+        should get the same session ID (based on system prompt only).
+        """
+        system_prompt = "You are Cline, a helpful assistant."
+
+        # First compression
+        compressed_request_1 = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "[Continue assisting the user!]"},
+                {"role": "assistant", "content": "Context note 1"},
+                {"role": "user", "content": "Continue helping"},
+                {"role": "assistant", "content": "I'll continue."},
+                {"role": "user", "content": "Thanks"},
+            ]
+        }
+        session_id_1 = tracker.get_session_id(compressed_request_1, client_ip="127.0.0.1")
+
+        # Second compression (different conversation content, same system prompt)
+        compressed_request_2 = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "[Continue assisting the user!]"},
+                {"role": "assistant", "content": "Different context note"},
+                {"role": "user", "content": "Different question"},
+                {"role": "assistant", "content": "Different answer"},
+                {"role": "user", "content": "More"},
+                {"role": "assistant", "content": "More answer"},
+            ]
+        }
+        session_id_2 = tracker.get_session_id(compressed_request_2, client_ip="127.0.0.1")
+
+        # Both compressed sessions should have the same ID
+        # (both use only system prompt for hashing)
+        assert session_id_1 == session_id_2
+
+    def test_original_vs_compressed_session_ids_differ(
+        self, tracker: "SessionTracker"
+    ) -> None:
+        """Test that original and compressed sessions have different IDs.
+
+        The original session ID includes the first user message, while the
+        compressed session only uses the system prompt. This is unavoidable
+        since we can't recover the original first user message after compression.
+        """
+        system_prompt = "You are Cline, a helpful assistant."
+
+        # Original request (few messages, no continuation marker)
+        original_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Help me with my project"},
+                {"role": "assistant", "content": "I'll help you."},
+            ]
+        }
+        original_session_id = tracker.get_session_id(original_request, client_ip="127.0.0.1")
+
+        # Compressed request (many messages, continuation marker)
+        compressed_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "[Continue assisting the user!]"},
+                {"role": "assistant", "content": "Context note"},
+                {"role": "user", "content": "Continue helping"},
+                {"role": "assistant", "content": "I'll continue."},
+                {"role": "user", "content": "Thanks"},
+            ]
+        }
+        compressed_session_id = tracker.get_session_id(
+            compressed_request, client_ip="127.0.0.1"
+        )
+
+        # Session IDs will differ because:
+        # - Original: hash(system + "Help me with my project")
+        # - Compressed: hash(system only)
+        assert original_session_id != compressed_session_id
+
+    def test_session_id_different_without_continuation(
+        self, tracker: "SessionTracker"
+    ) -> None:
+        """Test that different first user messages create different session IDs.
+
+        When there's no continuation marker, different first user messages
+        should result in different session IDs.
+        """
+        system_prompt = "You are Cline, a helpful assistant."
+
+        request1 = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Help me with project A"},
+            ]
+        }
+        request2 = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Help me with project B"},
+            ]
+        }
+
+        session_id_1 = tracker.get_session_id(request1, client_ip="127.0.0.1")
+        session_id_2 = tracker.get_session_id(request2, client_ip="127.0.0.1")
+
+        # Different first user messages = different session IDs
+        assert session_id_1 != session_id_2
+
+    def test_continuation_requires_many_messages(self, tracker: "SessionTracker") -> None:
+        """Test that continuation detection only applies with many messages.
+
+        A short conversation with a continuation marker should NOT be treated
+        as a compressed context (to avoid false positives).
+        """
+        system_prompt = "You are Cline, a helpful assistant."
+
+        # Short request with continuation marker (shouldn't trigger special handling)
+        short_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "[Continue assisting the user!]"},
+            ]
+        }
+
+        # Request without continuation marker (same message count)
+        normal_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Normal first message"},
+            ]
+        }
+
+        short_session_id = tracker.get_session_id(short_request, client_ip="127.0.0.1")
+        normal_session_id = tracker.get_session_id(normal_request, client_ip="127.0.0.1")
+
+        # With few messages, continuation detection doesn't apply
+        # So these should be different (different first user messages hashed)
+        assert short_session_id != normal_session_id
+
+    @pytest.mark.asyncio
+    async def test_compressed_session_attaches_to_active_session(self) -> None:
+        """Test that compressed sessions attach to active original sessions.
+
+        This is the key behavior: when Cline compresses context, if the original
+        session is still active (in memory), the compressed session should attach
+        to it rather than creating a new session.
+        """
+        from toolbridge import SessionTracker
+
+        tracker = SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=None,
+            archive_on_change=False,
+        )
+
+        system_prompt = "You are Cline, a helpful assistant."
+
+        # Original request (before compression)
+        original_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Help me with my project"},
+                {"role": "assistant", "content": "I'll help you."},
+            ]
+        }
+
+        # Track the original session (this creates the session and indexes it)
+        original_session_id = await tracker.track_request(
+            original_request, client_ip="127.0.0.1"
+        )
+
+        # Verify the session was created
+        stats = await tracker.get_session_stats(original_session_id)
+        assert stats is not None
+        assert stats.request_count == 1
+
+        # Compressed request (many messages, continuation marker)
+        compressed_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "[Continue assisting the user!]"},
+                {"role": "assistant", "content": "Context note"},
+                {"role": "user", "content": "Continue helping"},
+                {"role": "assistant", "content": "I'll continue."},
+                {"role": "user", "content": "Thanks"},
+            ]
+        }
+
+        # Track the compressed session - should attach to original
+        compressed_session_id = await tracker.track_request(
+            compressed_request, client_ip="127.0.0.1"
+        )
+
+        # Session IDs should match! The compressed session attached to the original.
+        assert compressed_session_id == original_session_id
+
+        # Verify request count incremented on the same session
+        stats = await tracker.get_session_stats(original_session_id)
+        assert stats is not None
+        assert stats.request_count == 2
+
+    @pytest.mark.asyncio
+    async def test_compressed_session_creates_new_when_original_expired(self) -> None:
+        """Test that compressed sessions create new session when original expired.
+
+        If the original session has expired (no longer in memory), the compressed
+        session should create a new session using the secondary fingerprint.
+        """
+        from toolbridge import SessionTracker
+
+        # Use very short timeout for testing
+        tracker = SessionTracker(
+            session_timeout=1,  # 1 second timeout
+            message_buffer_size=100,
+            archive=None,
+            archive_on_change=False,
+        )
+
+        system_prompt = "You are Cline, a helpful assistant."
+
+        # Original request
+        original_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Help me with my project"},
+            ]
+        }
+
+        # Track the original session
+        original_session_id = await tracker.track_request(
+            original_request, client_ip="127.0.0.1"
+        )
+
+        # Wait for session to "expire" (become stale)
+        import asyncio
+
+        await asyncio.sleep(1.1)
+
+        # Compressed request
+        compressed_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "[Continue assisting the user!]"},
+                {"role": "assistant", "content": "Context note"},
+                {"role": "user", "content": "Continue helping"},
+                {"role": "assistant", "content": "I'll continue."},
+                {"role": "user", "content": "Thanks"},
+            ]
+        }
+
+        # Get session ID (don't track yet) - should NOT match original because it's expired
+        compressed_session_id = tracker.get_session_id(
+            compressed_request, client_ip="127.0.0.1"
+        )
+
+        # Should be different from original (original expired, so no attachment)
+        assert compressed_session_id != original_session_id
+
+    @pytest.mark.asyncio
+    async def test_multimodal_first_user_message_extracts_task_block(self) -> None:
+        """Test that only the task block is used from multimodal first user message.
+
+        Cline sends first user message with multiple text blocks:
+        1. Task (e.g., "<task>Execute...</task>")
+        2. task_progress template
+        3. environment_details
+
+        Only the first block should be used for session ID hashing.
+        """
+        from toolbridge import SessionTracker
+
+        tracker = SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=None,
+            archive_on_change=False,
+        )
+
+        system_prompt = "You are Cline, a helpful assistant."
+
+        # Multimodal content (like Cline sends)
+        multimodal_content = [
+            {"type": "text", "text": "<task>Execute my-task.md</task>"},
+            {"type": "text", "text": "# task_progress RECOMMENDED\n...template..."},
+            {"type": "text", "text": "<environment_details>...</environment_details>"},
+        ]
+
+        # Request with multimodal content
+        multimodal_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": multimodal_content},
+            ]
+        }
+
+        # Request with just the task as plain string
+        plain_request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "<task>Execute my-task.md</task>"},
+            ]
+        }
+
+        multimodal_session_id = tracker.get_session_id(
+            multimodal_request, client_ip="127.0.0.1"
+        )
+        plain_session_id = tracker.get_session_id(plain_request, client_ip="127.0.0.1")
+
+        # Should be the same - only the first text block matters
+        assert multimodal_session_id == plain_session_id

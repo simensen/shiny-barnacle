@@ -123,6 +123,87 @@ class ChatMessage:
     prompt_tokens: int | None = None  # Snapshot of prompt_tokens at time of logging
 
 
+# =============================================================================
+# Context Continuation Detection
+# =============================================================================
+# Patterns that indicate a "continuation" message after context compression.
+# When agents hit context limits, they often start a fresh conversation with
+# a continuation marker. We detect these to maintain consistent session IDs.
+
+# Minimum message count to consider continuation detection.
+# Only applies when there are many messages (suggesting a compressed context).
+CONTINUATION_MIN_MESSAGES = 5
+
+# Patterns that indicate continuation messages (case-insensitive substring match)
+# These are typically the first text content in the first user message after compression.
+CONTINUATION_PATTERNS: list[str] = [
+    # Cline's context compression marker
+    "[Continue assisting the user!]",
+    "[Continue assisting the user]",
+    # Generic patterns other agents might use
+    "[Continuing conversation]",
+    "[Context continued]",
+    "[Conversation resumed]",
+]
+
+
+def _extract_text_content(content: Any) -> str:
+    """Extract text from message content (handles string and multimodal list formats)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # Multimodal content: [{'type': 'text', 'text': '...'}, ...]
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return " ".join(text_parts)
+    return ""
+
+
+def _extract_first_text_block(content: Any) -> str:
+    """Extract only the first text block from multimodal content.
+
+    Cline's first user message has multiple blocks:
+    1. The actual task (e.g., "<task>Execute...</task>") or continuation marker
+    2. task_progress template (system-injected)
+    3. environment_details (system-injected)
+
+    We only want the first block for session ID hashing.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content:
+        first_block = content[0]
+        if isinstance(first_block, dict) and first_block.get("type") == "text":
+            text_value = first_block.get("text", "")
+            return str(text_value) if text_value else ""
+        if isinstance(first_block, str):
+            return first_block
+    return ""
+
+
+def is_continuation_message(content: Any) -> bool:
+    """
+    Check if message content indicates a context continuation.
+
+    Args:
+        content: Message content (string or multimodal list)
+
+    Returns:
+        True if content starts with a known continuation pattern
+    """
+    text = _extract_text_content(content)
+    if not text:
+        return False
+
+    # Check if text starts with any continuation pattern (case-insensitive)
+    text_lower = text.lower().lstrip()
+    return any(text_lower.startswith(pattern.lower()) for pattern in CONTINUATION_PATTERNS)
+
+
 @dataclass
 class SessionStats:
     """Track per-session statistics"""
@@ -147,6 +228,9 @@ class SessionStats:
     # Agent detection - set on first request
     detected_agent: str | None = None
     detected_agent_confidence: str | None = None  # "high", "medium", "low"
+    # Secondary fingerprint for context compression recovery
+    # Hash of system prompt only, used to match compressed sessions to originals
+    secondary_fingerprint: str | None = None
 
 
 class SessionTracker:
@@ -190,12 +274,69 @@ class SessionTracker:
         self._flush_task: asyncio.Task[None] | None = None
         self._shutdown = False
 
+        # Secondary fingerprint index for context compression recovery
+        # Maps secondary_fingerprint -> session_id for quick lookups
+        self._secondary_fingerprints: dict[str, str] = {}
+
+    def _compute_secondary_fingerprint(
+        self, request: dict[str, Any], client_ip: str | None = None
+    ) -> str:
+        """
+        Compute secondary fingerprint based on system prompt only.
+
+        This fingerprint is used to match compressed sessions back to their
+        original session when context compression is detected.
+        """
+        messages = request.get("messages", [])
+        system_msg = messages[0] if messages else {}
+
+        normalized = [{"role": system_msg.get("role"), "content": system_msg.get("content", "")}]
+
+        content = json.dumps(normalized, sort_keys=True, ensure_ascii=True)
+        if client_ip:
+            content += f"|ip:{client_ip}"
+
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    def _find_session_by_secondary_fingerprint(
+        self, secondary_fp: str, client_ip: str | None = None
+    ) -> str | None:
+        """
+        Find an active (non-expired) session by secondary fingerprint.
+
+        Returns the session_id if found and active, None otherwise.
+        """
+        session_id = self._secondary_fingerprints.get(secondary_fp)
+        if not session_id:
+            return None
+
+        session = self._sessions.get(session_id)
+        if not session:
+            # Session was removed, clean up the index
+            del self._secondary_fingerprints[secondary_fp]
+            return None
+
+        # Check if session is still active (not expired)
+        if time.time() - session.last_seen_at > self.session_timeout:
+            return None
+
+        # Optionally verify client IP matches
+        if client_ip and session.client_ip and session.client_ip != client_ip:
+            return None
+
+        return session_id
+
     def get_session_id(self, request: dict[str, Any], client_ip: str | None = None) -> str:
         """
         Generate a stable session ID from a chat completion request.
 
-        Uses the first two messages (typically system + first user message)
-        which remain constant throughout a conversation.
+        Uses a dual-fingerprint approach:
+        1. Primary fingerprint: system prompt + first user message task block
+        2. Secondary fingerprint: system prompt only
+
+        When context compression is detected (continuation marker + many messages),
+        we look for an active session with matching secondary fingerprint to
+        maintain session continuity across compressions.
         """
         messages = request.get("messages", [])
 
@@ -203,14 +344,50 @@ class SessionTracker:
         if request.get("user"):
             return f"user_{request['user']}"
 
-        # Option 2: Hash the stable prefix (first 2 messages)
-        stable_messages = messages[:2]
+        # Compute secondary fingerprint (system prompt only)
+        secondary_fp = self._compute_secondary_fingerprint(request, client_ip)
+
+        # Check for continuation marker in first user message
+        first_user_msg = messages[1] if len(messages) > 1 else {}
+        first_user_content = first_user_msg.get("content", "")
+        first_text_block = _extract_first_text_block(first_user_content)
+
+        is_continuation = (
+            len(messages) >= CONTINUATION_MIN_MESSAGES
+            and first_user_msg.get("role") == "user"
+            and is_continuation_message(first_text_block)
+        )
+
+        if is_continuation:
+            # Look for active session with matching secondary fingerprint
+            existing_session_id = self._find_session_by_secondary_fingerprint(
+                secondary_fp, client_ip
+            )
+            if existing_session_id:
+                logger.info(
+                    f"Context compression detected, attaching to existing session "
+                    f"{existing_session_id} via secondary fingerprint"
+                )
+                return existing_session_id
+            else:
+                # No active session found, use secondary fingerprint as session ID
+                # This ensures future compressions will match
+                logger.info(
+                    "Context compression detected, no active session found, "
+                    "using secondary fingerprint for new session"
+                )
+                return secondary_fp
+
+        # Normal case: hash system prompt + first text block of first user message
+        system_msg = messages[0] if messages else {}
         normalized = [
-            {"role": msg.get("role"), "content": msg.get("content", "")}
-            for msg in stable_messages
+            {"role": system_msg.get("role"), "content": system_msg.get("content", "")},
         ]
 
-        # Include client IP for multi-user separation
+        # Add first user message's task block (not the full content with templates)
+        if len(messages) > 1 and first_user_msg.get("role") == "user":
+            normalized.append({"role": "user", "content": first_text_block})
+
         content = json.dumps(normalized, sort_keys=True, ensure_ascii=True)
         if client_ip:
             content += f"|ip:{client_ip}"
@@ -235,13 +412,19 @@ class SessionTracker:
         """
         session_id = self.get_session_id(request, client_ip)
 
+        # Compute secondary fingerprint for context compression recovery
+        secondary_fp = self._compute_secondary_fingerprint(request, client_ip)
+
         async with self._lock:
             is_new_session = session_id not in self._sessions
             if is_new_session:
                 self._sessions[session_id] = SessionStats(
                     client_ip=client_ip,
                     messages=deque(maxlen=self.message_buffer_size),
+                    secondary_fingerprint=secondary_fp,
                 )
+                # Index the secondary fingerprint for quick lookups
+                self._secondary_fingerprints[secondary_fp] = session_id
 
             session_stats = self._sessions[session_id]
             session_stats.last_seen_at = time.time()
@@ -250,10 +433,13 @@ class SessionTracker:
             session_stats.tool_calls_fixed += tool_calls_fixed
             session_stats.tool_calls_failed += tool_calls_failed
 
-            # Update token usage - last request values
-            session_stats.last_prompt_tokens = prompt_tokens
-            session_stats.last_completion_tokens = completion_tokens
-            session_stats.last_total_tokens = total_tokens
+            # Update token usage - last request values (only if we got valid data)
+            # Some requests return 0/null tokens (e.g., during context compression)
+            # In those cases, preserve the previous values rather than zeroing them out
+            if prompt_tokens > 0:
+                session_stats.last_prompt_tokens = prompt_tokens
+                session_stats.last_completion_tokens = completion_tokens
+                session_stats.last_total_tokens = total_tokens
 
             # Update token usage - cumulative totals
             session_stats.prompt_tokens_total += prompt_tokens
@@ -402,6 +588,11 @@ class SessionTracker:
                     stats = self._sessions[sid]
                     archive_data = session_stats_to_archive_dict(sid, stats)
                     await self.archive.archive_session(sid, archive_data)
+
+                # Clean up secondary fingerprint index
+                stats = self._sessions[sid]
+                if stats.secondary_fingerprint:
+                    self._secondary_fingerprints.pop(stats.secondary_fingerprint, None)
 
                 del self._sessions[sid]
                 removed += 1
@@ -588,6 +779,8 @@ class SessionTracker:
                     )
                 )
 
+            secondary_fp = session_data.get("secondary_fingerprint")
+
             stats = SessionStats(
                 created_at=session_data.get("created_at", now),
                 last_seen_at=session_data.get("last_seen_at", now),
@@ -604,10 +797,14 @@ class SessionTracker:
                 prompt_tokens_total=session_data.get("prompt_tokens_total", 0),
                 completion_tokens_total=session_data.get("completion_tokens_total", 0),
                 total_tokens_total=session_data.get("total_tokens_total", 0),
+                secondary_fingerprint=secondary_fp,
             )
 
             async with self._lock:
                 self._sessions[summary.session_id] = stats
+                # Rebuild secondary fingerprint index
+                if secondary_fp:
+                    self._secondary_fingerprints[secondary_fp] = summary.session_id
             restored += 1
 
         if restored > 0:
