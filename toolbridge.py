@@ -29,11 +29,14 @@ from typing import Any
 from xml.sax.saxutils import unescape as xml_unescape
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from archive import SessionArchive, session_stats_to_archive_dict
+from paths import get_archive_dir
 
 # Configure logging
 logging.basicConfig(
@@ -149,16 +152,23 @@ class SessionTracker:
     (first 2 messages: typically system prompt + first user message).
     """
 
-    def __init__(self, session_timeout: int = 3600, message_buffer_size: int = 1024):
+    def __init__(
+        self,
+        session_timeout: int = 3600,
+        message_buffer_size: int = 1024,
+        archive: SessionArchive | None = None,
+    ):
         """
         Args:
             session_timeout: Seconds of inactivity before session expires (default 1 hour)
             message_buffer_size: Max messages per session circular buffer (default 1024)
+            archive: Optional SessionArchive for persisting expired sessions
         """
         self._sessions: dict[str, SessionStats] = {}
         self._lock = asyncio.Lock()
         self.session_timeout = session_timeout
         self.message_buffer_size = message_buffer_size
+        self.archive = archive
 
     def get_session_id(self, request: dict[str, Any], client_ip: str | None = None) -> str:
         """
@@ -331,7 +341,7 @@ class SessionTracker:
             return dict(self._sessions)
 
     async def _cleanup_expired(self) -> int:
-        """Remove expired sessions. Returns count of removed sessions."""
+        """Remove expired sessions, archiving them if enabled. Returns count of removed sessions."""
         now = time.time()
         removed = 0
 
@@ -341,7 +351,14 @@ class SessionTracker:
                 for sid, stats in self._sessions.items()
                 if now - stats.last_seen_at > self.session_timeout
             ]
+
             for sid in expired_ids:
+                # Archive before deletion if archive is enabled
+                if self.archive is not None:
+                    stats = self._sessions[sid]
+                    archive_data = session_stats_to_archive_dict(sid, stats)
+                    await self.archive.archive_session(sid, archive_data)
+
                 del self._sessions[sid]
                 removed += 1
 
@@ -350,6 +367,9 @@ class SessionTracker:
 
 # Global session tracker instance
 session_tracker = SessionTracker(session_timeout=3600)
+
+# Global session archive instance (initialized in main() based on config)
+session_archive: SessionArchive | None = None
 
 
 class ProxyConfig(BaseSettings):
@@ -465,6 +485,20 @@ class ProxyConfig(BaseSettings):
     cors_all_routes: bool = Field(
         default=False,
         description="Enable CORS for ALL routes including /v1/* proxy endpoints",
+    )
+
+    # Archive settings
+    archive_enabled: bool = Field(
+        default=True,
+        description="Enable session archiving when sessions expire",
+    )
+    archive_dir: str | None = Field(
+        default=None,
+        description="Directory for session archives (default: XDG state dir)",
+    )
+    archive_ttl_hours: int = Field(
+        default=168,
+        description="Hours to retain archived sessions (0 = forever, default: 168 = 7 days)",
     )
 
 
@@ -1641,19 +1675,37 @@ async def get_stats() -> dict[str, Any]:
 
 
 @app.get("/admin/sessions")
-async def get_sessions() -> dict[str, Any]:
+async def get_sessions(
+    include_archived: bool = Query(
+        default=False,
+        description="Include archived sessions in the response",
+    ),
+    archived_only: bool = Query(
+        default=False,
+        description="Only return archived sessions (ignores active sessions)",
+    ),
+) -> dict[str, Any]:
     """
-    Return all active sessions and their stats.
+    Return sessions and their stats.
 
     Useful for debugging and monitoring per-session behavior.
-    Sessions expire after 1 hour of inactivity.
+    Active sessions expire after 1 hour of inactivity.
+
+    Query parameters:
+    - include_archived: Include archived sessions alongside active ones
+    - archived_only: Only show archived sessions (ignores active sessions)
     """
-    sessions = await session_tracker.get_all_sessions()
-    return {
-        "active_sessions": len(sessions),
+    result: dict[str, Any] = {
         "session_timeout_seconds": session_tracker.session_timeout,
-        "sessions": {
-            sid: {
+        "sessions": {},
+    }
+
+    # Get active sessions (unless archived_only)
+    if not archived_only:
+        sessions = await session_tracker.get_all_sessions()
+        result["active_sessions"] = len(sessions)
+        for sid, session_stats in sessions.items():
+            result["sessions"][sid] = {
                 "created_at": session_stats.created_at,
                 "last_seen_at": session_stats.last_seen_at,
                 "age_seconds": round(time.time() - session_stats.created_at, 1),
@@ -1676,10 +1728,51 @@ async def get_sessions() -> dict[str, Any]:
                 "prompt_tokens_total": session_stats.prompt_tokens_total,
                 "completion_tokens_total": session_stats.completion_tokens_total,
                 "total_tokens_total": session_stats.total_tokens_total,
+                "is_archived": False,
             }
-            for sid, session_stats in sessions.items()
-        },
-    }
+    else:
+        result["active_sessions"] = 0
+
+    # Get archived sessions if requested
+    if (include_archived or archived_only) and session_archive is not None:
+        archived_summaries = await session_archive.list_sessions(limit=1000)
+        result["archived_sessions"] = len(archived_summaries)
+
+        for summary in archived_summaries:
+            # Skip if already in active sessions (shouldn't happen, but be safe)
+            if summary.session_id in result["sessions"]:
+                continue
+
+            result["sessions"][summary.session_id] = {
+                "created_at": summary.created_at,
+                "last_seen_at": summary.last_seen_at,
+                "archived_at": summary.archived_at,
+                "age_seconds": round(time.time() - summary.created_at, 1),
+                "idle_seconds": round(time.time() - summary.last_seen_at, 1),
+                "request_count": summary.request_count,
+                "tool_calls_total": summary.tool_calls_total,
+                "tool_calls_fixed": summary.tool_calls_fixed,
+                "tool_calls_failed": summary.tool_calls_failed,
+                "fix_rate": round(
+                    summary.tool_calls_fixed / max(summary.tool_calls_total, 1),
+                    3,
+                ),
+                "client_ip": summary.client_ip,
+                # Archived sessions don't have last_ token values
+                "last_prompt_tokens": 0,
+                "last_completion_tokens": 0,
+                "last_total_tokens": 0,
+                # Token usage - cumulative
+                "prompt_tokens_total": summary.prompt_tokens_total,
+                "completion_tokens_total": summary.completion_tokens_total,
+                "total_tokens_total": summary.total_tokens_total,
+                "is_archived": True,
+            }
+    elif include_archived or archived_only:
+        result["archived_sessions"] = 0
+        result["archive_note"] = "Archiving is disabled"
+
+    return result
 
 
 @app.get("/admin/sessions/{session_id}", response_model=None)
@@ -1691,67 +1784,126 @@ async def get_session(
     """
     Get stats for a specific session.
 
+    Checks active sessions first, then falls back to archive if not found.
+
     Args:
         session_id: The session ID to look up
         include_messages: Whether to include chat messages (default: True)
         message_limit: Maximum number of recent messages to return (default: 100)
     """
+    # First, check active sessions
     session_stats = await session_tracker.get_session_stats(session_id)
-    if not session_stats:
-        return JSONResponse(
-            status_code=404,
-            content={"error": "Session not found", "session_id": session_id}
-        )
 
-    result = {
-        "session_id": session_id,
-        "created_at": session_stats.created_at,
-        "last_seen_at": session_stats.last_seen_at,
-        "age_seconds": round(time.time() - session_stats.created_at, 1),
-        "idle_seconds": round(time.time() - session_stats.last_seen_at, 1),
-        "request_count": session_stats.request_count,
-        "tool_calls_total": session_stats.tool_calls_total,
-        "tool_calls_fixed": session_stats.tool_calls_fixed,
-        "tool_calls_failed": session_stats.tool_calls_failed,
-        "fix_rate": round(
-            session_stats.tool_calls_fixed / max(session_stats.tool_calls_total, 1), 3
-        ),
-        "client_ip": session_stats.client_ip,
-        # Token usage - last request (shows current context window size)
-        "last_prompt_tokens": session_stats.last_prompt_tokens,
-        "last_completion_tokens": session_stats.last_completion_tokens,
-        "last_total_tokens": session_stats.last_total_tokens,
-        # Token usage - cumulative (shows total session cost)
-        "prompt_tokens_total": session_stats.prompt_tokens_total,
-        "completion_tokens_total": session_stats.completion_tokens_total,
-        "total_tokens_total": session_stats.total_tokens_total,
-    }
+    if session_stats:
+        # Active session found
+        result: dict[str, Any] = {
+            "session_id": session_id,
+            "created_at": session_stats.created_at,
+            "last_seen_at": session_stats.last_seen_at,
+            "age_seconds": round(time.time() - session_stats.created_at, 1),
+            "idle_seconds": round(time.time() - session_stats.last_seen_at, 1),
+            "request_count": session_stats.request_count,
+            "tool_calls_total": session_stats.tool_calls_total,
+            "tool_calls_fixed": session_stats.tool_calls_fixed,
+            "tool_calls_failed": session_stats.tool_calls_failed,
+            "fix_rate": round(
+                session_stats.tool_calls_fixed / max(session_stats.tool_calls_total, 1), 3
+            ),
+            "client_ip": session_stats.client_ip,
+            # Token usage - last request (shows current context window size)
+            "last_prompt_tokens": session_stats.last_prompt_tokens,
+            "last_completion_tokens": session_stats.last_completion_tokens,
+            "last_total_tokens": session_stats.last_total_tokens,
+            # Token usage - cumulative (shows total session cost)
+            "prompt_tokens_total": session_stats.prompt_tokens_total,
+            "completion_tokens_total": session_stats.completion_tokens_total,
+            "total_tokens_total": session_stats.total_tokens_total,
+            "is_archived": False,
+        }
 
-    if include_messages:
-        # Get the most recent messages (up to message_limit)
-        messages = list(session_stats.messages)[-message_limit:]
-        result["messages"] = [
-            {
-                "timestamp": msg.timestamp,
-                "direction": msg.direction,
-                "role": msg.role,
-                "content": msg.content,
-                "tool_calls": msg.tool_calls,
-                "raw_content": msg.raw_content,  # Original content before transformation
-                "debug": msg.debug,  # Original JSON payload
-                "prompt_tokens": msg.prompt_tokens,  # Context size at this point
+        if include_messages:
+            # Get the most recent messages (up to message_limit)
+            messages = list(session_stats.messages)[-message_limit:]
+            result["messages"] = [
+                {
+                    "timestamp": msg.timestamp,
+                    "direction": msg.direction,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "tool_calls": msg.tool_calls,
+                    "raw_content": msg.raw_content,
+                    "debug": msg.debug,
+                    "prompt_tokens": msg.prompt_tokens,
+                }
+                for msg in messages
+            ]
+            result["total_messages"] = len(session_stats.messages)
+            result["message_buffer_size"] = config.message_buffer_size
+
+        return result
+
+    # Not in active sessions, check archive
+    if session_archive is not None:
+        archived_data = await session_archive.get_session(session_id)
+        if archived_data:
+            result = {
+                "session_id": session_id,
+                "created_at": archived_data.get("created_at", 0),
+                "last_seen_at": archived_data.get("last_seen_at", 0),
+                "archived_at": archived_data.get("archived_at", 0),
+                "age_seconds": round(
+                    time.time() - archived_data.get("created_at", time.time()), 1
+                ),
+                "idle_seconds": round(
+                    time.time() - archived_data.get("last_seen_at", time.time()), 1
+                ),
+                "request_count": archived_data.get("request_count", 0),
+                "tool_calls_total": archived_data.get("tool_calls_total", 0),
+                "tool_calls_fixed": archived_data.get("tool_calls_fixed", 0),
+                "tool_calls_failed": archived_data.get("tool_calls_failed", 0),
+                "fix_rate": round(
+                    archived_data.get("tool_calls_fixed", 0)
+                    / max(archived_data.get("tool_calls_total", 1), 1),
+                    3,
+                ),
+                "client_ip": archived_data.get("client_ip"),
+                # Token usage - last request (archived sessions store these)
+                "last_prompt_tokens": archived_data.get("last_prompt_tokens", 0),
+                "last_completion_tokens": archived_data.get("last_completion_tokens", 0),
+                "last_total_tokens": archived_data.get("last_total_tokens", 0),
+                # Token usage - cumulative
+                "prompt_tokens_total": archived_data.get("prompt_tokens_total", 0),
+                "completion_tokens_total": archived_data.get("completion_tokens_total", 0),
+                "total_tokens_total": archived_data.get("total_tokens_total", 0),
+                "is_archived": True,
             }
-            for msg in messages
-        ]
-        result["total_messages"] = len(session_stats.messages)
-        result["message_buffer_size"] = config.message_buffer_size
 
-    return result
+            if include_messages:
+                messages = archived_data.get("messages", [])[-message_limit:]
+                result["messages"] = messages
+                result["total_messages"] = len(archived_data.get("messages", []))
+                result["message_buffer_size"] = config.message_buffer_size
+
+            return result
+
+    return JSONResponse(
+        status_code=404,
+        content={"error": "Session not found", "session_id": session_id}
+    )
 
 
 @app.get("/config")
 async def get_config() -> dict[str, Any]:
     """Get current proxy configuration."""
+    archive_config: dict[str, Any] = {
+        "enabled": config.archive_enabled,
+        "ttl_hours": config.archive_ttl_hours,
+    }
+    if session_archive is not None:
+        archive_config["directory"] = str(session_archive.archive_dir)
+    else:
+        archive_config["directory"] = None
+
     return {
         "backend_url": config.backend_url,
         "transform_enabled": config.transform_enabled,
@@ -1760,6 +1912,7 @@ async def get_config() -> dict[str, Any]:
             "enabled": config.log_messages,
             "buffer_size": config.message_buffer_size,
         },
+        "archive": archive_config,
         "sampling_overrides": {
             "temperature": config.temperature,
             "top_p": config.top_p,
@@ -1901,6 +2054,9 @@ Environment Variables:
   TOOLBRIDGE_CORS_ENABLED      Enable CORS (true/false)
   TOOLBRIDGE_CORS_ORIGINS      Comma-separated allowed origins (as JSON list)
   TOOLBRIDGE_CORS_ALL_ROUTES   Enable CORS for all routes (true/false)
+  TOOLBRIDGE_ARCHIVE_ENABLED   Enable session archiving (true/false, default: true)
+  TOOLBRIDGE_ARCHIVE_DIR       Archive directory (default: XDG state dir)
+  TOOLBRIDGE_ARCHIVE_TTL_HOURS Hours to retain archives (default: 168 = 7 days)
 
 Examples:
   # Basic usage (reads from env vars / .env if available)
@@ -2049,6 +2205,36 @@ Examples:
         "(use with caution) [env: TOOLBRIDGE_CORS_ALL_ROUTES=true]",
     )
 
+    # Archive settings
+    archive_group = parser.add_argument_group(
+        "archive settings (for expired session persistence)"
+    )
+    archive_group.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Disable session archiving [env: TOOLBRIDGE_ARCHIVE_ENABLED=false]",
+    )
+    archive_group.add_argument(
+        "--archive-dir",
+        type=str,
+        default=None,
+        help=_env_help(
+            "TOOLBRIDGE_ARCHIVE_DIR",
+            "Directory for session archives",
+            "${XDG_STATE_HOME:-~/.local/state}/toolbridge/archives",
+        ),
+    )
+    archive_group.add_argument(
+        "--archive-ttl",
+        type=int,
+        default=None,
+        help=_env_help(
+            "TOOLBRIDGE_ARCHIVE_TTL_HOURS",
+            "Hours to retain archived sessions (0 = forever)",
+            "168",
+        ),
+    )
+
     args = parser.parse_args()
 
     # Apply CLI overrides - only if explicitly provided (not None)
@@ -2096,15 +2282,35 @@ Examples:
     if args.cors_origins:
         config.cors_origins = [o.strip() for o in args.cors_origins.split(",")]
 
+    # Archive settings - CLI flags override env vars
+    if args.no_archive:
+        config.archive_enabled = False
+    if args.archive_dir is not None:
+        config.archive_dir = args.archive_dir
+    if args.archive_ttl is not None:
+        config.archive_ttl_hours = args.archive_ttl
+
     # Debug mode - can be set via CLI or env var
     if args.debug:
         config.debug = True
 
-    # Reinitialize session tracker with configured buffer size
+    # Initialize session archive if enabled
+    global session_archive
+    if config.archive_enabled:
+        archive_dir = get_archive_dir(config.archive_dir)
+        session_archive = SessionArchive(
+            archive_dir=archive_dir,
+            archive_ttl_hours=config.archive_ttl_hours,
+        )
+    else:
+        session_archive = None
+
+    # Reinitialize session tracker with configured buffer size and archive
     global session_tracker
     session_tracker = SessionTracker(
         session_timeout=3600,
         message_buffer_size=config.message_buffer_size,
+        archive=session_archive,
     )
 
     # Apply debug logging level
@@ -2202,6 +2408,18 @@ Examples:
         logger.info(f"  CORS origins: {origins_display}")
     else:
         logger.info("  CORS: disabled")
+
+    # Log archive configuration
+    if config.archive_enabled and session_archive is not None:
+        ttl_display = (
+            f"{config.archive_ttl_hours} hours"
+            if config.archive_ttl_hours > 0
+            else "forever"
+        )
+        logger.info(f"  Session archive: enabled (TTL: {ttl_display})")
+        logger.info(f"  Archive directory: {session_archive.archive_dir}")
+    else:
+        logger.info("  Session archive: disabled")
 
     import uvicorn
 
