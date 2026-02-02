@@ -92,6 +92,10 @@ export interface SessionSummary {
   completion_tokens_total: number | null;
   /** Cumulative total tokens across all requests in this session */
   total_tokens_total: number | null;
+  /** Detected AI coding assistant name (e.g., 'Cline', 'Cursor', 'Claude Code'). Null if no agent detected. */
+  detected_agent: string | null;
+  /** Confidence level of agent detection: 'high' for known agent patterns, 'medium' for generic patterns, 'low' for weak signals. Null if no agent detected. */
+  detected_agent_confidence: "high" | "medium" | "low" | null;
 }
 
 /**
@@ -145,6 +149,10 @@ export interface SessionDetailResponse {
   completion_tokens_total: number | null;
   /** Cumulative total tokens across all requests in this session */
   total_tokens_total: number | null;
+  /** Detected AI coding assistant name (e.g., 'Cline', 'Cursor', 'Claude Code'). Null if no agent detected. */
+  detected_agent: string | null;
+  /** Confidence level of agent detection: 'high' for known agent patterns, 'medium' for generic patterns, 'low' for weak signals. Null if no agent detected. */
+  detected_agent_confidence: "high" | "medium" | "low" | null;
   /** Total number of messages in the buffer (only if include_messages=true) */
   total_messages?: number;
   /** Configured message buffer size limit (only if include_messages=true) */

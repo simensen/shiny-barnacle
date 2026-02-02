@@ -84,6 +84,15 @@
           "type": ["integer", "null"],
           "minimum": 0,
           "description": "Cumulative total tokens across all requests in this session"
+        },
+        "detected_agent": {
+          "type": ["string", "null"],
+          "description": "Detected AI coding assistant name (e.g., 'Cline', 'Cursor', 'Claude Code'). Null if no agent detected."
+        },
+        "detected_agent_confidence": {
+          "type": ["string", "null"],
+          "enum": ["high", "medium", "low", null],
+          "description": "Confidence level of agent detection: 'high' for known agent patterns, 'medium' for generic patterns, 'low' for weak signals. Null if no agent detected."
         }
       },
       "required": [
@@ -287,6 +296,15 @@
           "type": ["integer", "null"],
           "minimum": 0,
           "description": "Cumulative total tokens across all requests in this session"
+        },
+        "detected_agent": {
+          "type": ["string", "null"],
+          "description": "Detected AI coding assistant name (e.g., 'Cline', 'Cursor', 'Claude Code'). Null if no agent detected."
+        },
+        "detected_agent_confidence": {
+          "type": ["string", "null"],
+          "enum": ["high", "medium", "low", null],
+          "description": "Confidence level of agent detection: 'high' for known agent patterns, 'medium' for generic patterns, 'low' for weak signals. Null if no agent detected."
         },
         "total_messages": {
           "type": "integer",
