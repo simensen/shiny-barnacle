@@ -301,6 +301,59 @@ class ArchiveIndex:
         logger.info(f"Rebuilt archive index: {len(sessions)} sessions")
         return len(sessions)
 
+    async def validate(self) -> tuple[bool, int]:
+        """
+        Validate the index and rebuild if necessary.
+
+        Checks if:
+        1. Index file exists
+        2. Index file is valid JSON
+        3. Index is not empty when archive directories exist
+
+        Returns:
+            Tuple of (was_rebuilt, session_count)
+        """
+        async with self._async_lock:
+            return await asyncio.to_thread(self._validate_sync)
+
+    def _validate_sync(self) -> tuple[bool, int]:
+        """Synchronous version for thread pool execution."""
+        needs_rebuild = False
+
+        # Check if index file exists
+        if not self.index_path.exists():
+            # Check if there are any archive directories with sessions
+            if self.archive_dir.exists():
+                for date_dir in self.archive_dir.iterdir():
+                    if date_dir.is_dir() and list(date_dir.glob("*.json")):
+                        needs_rebuild = True
+                        logger.warning("Index file missing but archive directories exist, rebuilding")
+                        break
+        else:
+            # Try to read the index
+            try:
+                with self._lock:
+                    with open(self.index_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                        if "sessions" not in data:
+                            needs_rebuild = True
+                            logger.warning("Index file corrupted (missing sessions key), rebuilding")
+            except (json.JSONDecodeError, OSError) as e:
+                needs_rebuild = True
+                logger.warning(f"Index file corrupted or unreadable: {e}, rebuilding")
+
+        if needs_rebuild:
+            count = self._rebuild_from_disk_sync()
+            return (True, count)
+
+        # Return current session count
+        try:
+            with self._lock:
+                data = self._read_index_sync()
+                return (False, len(data.get("sessions", {})))
+        except Timeout:
+            return (False, 0)
+
 
 class SessionArchive:
     """
@@ -331,6 +384,45 @@ class SessionArchive:
         self.archive_dir = archive_dir or get_archive_dir()
         self.archive_ttl_hours = archive_ttl_hours
         self.index = ArchiveIndex(self.archive_dir)
+
+    async def validate_on_startup(self) -> dict[str, Any]:
+        """
+        Validate the archive on startup.
+
+        Should be called when the application starts to ensure the index
+        is consistent with files on disk. This will:
+        1. Check if the index file exists and is valid
+        2. Rebuild the index from disk if corrupted or missing
+        3. Run TTL cleanup to remove expired archives
+
+        Returns:
+            Dict with validation results:
+            - index_rebuilt: bool - Whether index was rebuilt
+            - session_count: int - Number of archived sessions
+            - expired_removed: int - Number of expired sessions cleaned up
+        """
+        # Validate and potentially rebuild index
+        was_rebuilt, session_count = await self.index.validate()
+
+        # Run TTL cleanup
+        expired_removed = await self.cleanup_expired()
+
+        # Update session count after cleanup
+        if expired_removed > 0:
+            session_count = await self.get_session_count()
+
+        result = {
+            "index_rebuilt": was_rebuilt,
+            "session_count": session_count,
+            "expired_removed": expired_removed,
+        }
+
+        if was_rebuilt:
+            logger.info(f"Archive startup validation: index rebuilt with {session_count} sessions")
+        if expired_removed > 0:
+            logger.info(f"Archive startup validation: removed {expired_removed} expired sessions")
+
+        return result
 
     async def archive_session(
         self,
@@ -427,12 +519,16 @@ class SessionArchive:
         """
         List archived sessions.
 
+        This method performs lazy cleanup: if a session is in the index but
+        its file has been manually deleted, the stale index entry is removed
+        and the session is excluded from results.
+
         Args:
             limit: Maximum number of sessions to return
             offset: Number of sessions to skip
 
         Returns:
-            List of ArchivedSessionSummary objects
+            List of ArchivedSessionSummary objects (excludes stale entries)
         """
         index_sessions = await self.index.list_sessions()
 
@@ -447,6 +543,8 @@ class SessionArchive:
         paginated = sorted_sessions[offset:offset + limit]
 
         # Build summaries (requires reading each file for full data)
+        # get_session() handles lazy cleanup: removes stale index entries
+        # if the session file was manually deleted
         summaries: list[ArchivedSessionSummary] = []
         for session_id, info in paginated:
             session_data = await self.get_session(session_id)

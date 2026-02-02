@@ -24,6 +24,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 from xml.sax.saxutils import unescape as xml_unescape
@@ -508,7 +509,35 @@ def load_config() -> ProxyConfig:
 
 
 config = load_config()
-app = FastAPI(title="LLM Response Transformer Proxy")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """FastAPI lifespan context manager for startup/shutdown tasks."""
+    # Startup: validate archive index if archiving is enabled
+    if session_archive is not None:
+        logger.info("Validating session archive on startup...")
+        validation_result = await session_archive.validate_on_startup()
+        if validation_result["index_rebuilt"]:
+            logger.info(
+                f"  Archive index was rebuilt: {validation_result['session_count']} sessions"
+            )
+        if validation_result["expired_removed"] > 0:
+            logger.info(
+                f"  Expired archives cleaned up: {validation_result['expired_removed']} sessions"
+            )
+        if not validation_result["index_rebuilt"] and validation_result["expired_removed"] == 0:
+            logger.info(
+                f"  Archive validated: {validation_result['session_count']} sessions"
+            )
+
+    yield  # App runs here
+
+    # Shutdown: nothing to do currently
+    pass
+
+
+app = FastAPI(title="LLM Response Transformer Proxy", lifespan=lifespan)
 
 
 def apply_sampling_params(body: dict[str, Any]) -> dict[str, Any]:

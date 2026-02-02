@@ -356,3 +356,220 @@ class TestSessionStatsToArchiveDict:
         assert result["client_ip"] == "127.0.0.1"
         assert len(result["messages"]) == 1
         assert result["messages"][0]["content"] == "Hello"
+
+
+class TestArchiveIndexValidation:
+    """Tests for ArchiveIndex validation and rebuild."""
+
+    @pytest.fixture
+    def archive_dir(self) -> Path:
+        """Create a temporary archive directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def index(self, archive_dir: Path) -> ArchiveIndex:
+        """Create an ArchiveIndex instance."""
+        ensure_dir(archive_dir)
+        return ArchiveIndex(archive_dir)
+
+    @pytest.mark.asyncio
+    async def test_validate_empty_archive(self, index: ArchiveIndex) -> None:
+        """Test validation on empty archive (no index, no files)."""
+        was_rebuilt, count = await index.validate()
+
+        # No rebuild needed for empty archive
+        assert was_rebuilt is False
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_validate_corrupted_index(
+        self, archive_dir: Path, index: ArchiveIndex
+    ) -> None:
+        """Test validation rebuilds corrupted index file."""
+        # Create a corrupted index file
+        ensure_dir(archive_dir)
+        with open(archive_dir / "index.json", "w") as f:
+            f.write("not valid json {{{")
+
+        was_rebuilt, count = await index.validate()
+
+        assert was_rebuilt is True
+        assert count == 0  # No session files to index
+
+    @pytest.mark.asyncio
+    async def test_validate_missing_index_with_sessions(
+        self, archive_dir: Path, index: ArchiveIndex
+    ) -> None:
+        """Test validation rebuilds index when files exist but index is missing."""
+        # Create a date directory with a session file but no index
+        date_dir = archive_dir / "2026-02-02"
+        ensure_dir(date_dir)
+        with open(date_dir / "session123.json", "w") as f:
+            f.write('{"session_id": "session123", "archived_at": 1738512000.0}')
+
+        was_rebuilt, count = await index.validate()
+
+        assert was_rebuilt is True
+        assert count == 1
+
+        # Verify the session is now in the index
+        location = await index.get_session_location("session123")
+        assert location == "2026-02-02"
+
+    @pytest.mark.asyncio
+    async def test_validate_valid_index(
+        self, archive_dir: Path, index: ArchiveIndex
+    ) -> None:
+        """Test validation passes for valid index."""
+        # Add a session normally
+        await index.add_session("session123", "2026-02-02", 1738512000.0)
+
+        was_rebuilt, count = await index.validate()
+
+        assert was_rebuilt is False
+        assert count == 1
+
+
+class TestSessionArchiveValidation:
+    """Tests for SessionArchive startup validation."""
+
+    @pytest.fixture
+    def archive_dir(self) -> Path:
+        """Create a temporary archive directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def archive(self, archive_dir: Path) -> SessionArchive:
+        """Create a SessionArchive instance."""
+        return SessionArchive(archive_dir=archive_dir, archive_ttl_hours=168)
+
+    @pytest.fixture
+    def sample_session_data(self) -> dict:
+        """Create sample session data."""
+        return {
+            "session_id": "test_session",
+            "created_at": time.time() - 3600,
+            "last_seen_at": time.time(),
+            "request_count": 5,
+            "tool_calls_total": 10,
+            "tool_calls_fixed": 8,
+            "tool_calls_failed": 2,
+            "client_ip": "192.168.1.100",
+            "last_prompt_tokens": 1000,
+            "last_completion_tokens": 500,
+            "last_total_tokens": 1500,
+            "prompt_tokens_total": 5000,
+            "completion_tokens_total": 2500,
+            "total_tokens_total": 7500,
+            "messages": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_validate_on_startup_empty(self, archive: SessionArchive) -> None:
+        """Test startup validation on empty archive."""
+        result = await archive.validate_on_startup()
+
+        assert result["index_rebuilt"] is False
+        assert result["session_count"] == 0
+        assert result["expired_removed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_validate_on_startup_with_sessions(
+        self, archive: SessionArchive, sample_session_data: dict
+    ) -> None:
+        """Test startup validation with existing sessions."""
+        await archive.archive_session("session1", sample_session_data)
+
+        result = await archive.validate_on_startup()
+
+        assert result["index_rebuilt"] is False
+        assert result["session_count"] == 1
+        assert result["expired_removed"] == 0
+
+
+class TestLazyCleanup:
+    """Tests for lazy cleanup during list_sessions."""
+
+    @pytest.fixture
+    def archive_dir(self) -> Path:
+        """Create a temporary archive directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def archive(self, archive_dir: Path) -> SessionArchive:
+        """Create a SessionArchive instance."""
+        return SessionArchive(archive_dir=archive_dir, archive_ttl_hours=168)
+
+    @pytest.fixture
+    def sample_session_data(self) -> dict:
+        """Create sample session data."""
+        return {
+            "session_id": "test_session",
+            "created_at": time.time() - 3600,
+            "last_seen_at": time.time(),
+            "request_count": 5,
+            "tool_calls_total": 10,
+            "tool_calls_fixed": 8,
+            "tool_calls_failed": 2,
+            "client_ip": "192.168.1.100",
+            "prompt_tokens_total": 5000,
+            "completion_tokens_total": 2500,
+            "total_tokens_total": 7500,
+            "messages": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_removes_stale_entries(
+        self, archive: SessionArchive, archive_dir: Path, sample_session_data: dict
+    ) -> None:
+        """Test that list_sessions removes stale index entries for deleted files."""
+        # Archive two sessions
+        await archive.archive_session("session1", sample_session_data)
+        sample_session_data["session_id"] = "session2"
+        await archive.archive_session("session2", sample_session_data)
+
+        # Verify both are in the index
+        sessions = await archive.index.list_sessions()
+        assert len(sessions) == 2
+
+        # Manually delete session1's file (simulating user deletion)
+        date_str = sessions["session1"]["date"]
+        session_file = archive_dir / date_str / "session1.json"
+        session_file.unlink()
+
+        # List sessions - should trigger lazy cleanup
+        summaries = await archive.list_sessions()
+
+        # Only session2 should be returned
+        assert len(summaries) == 1
+        assert summaries[0].session_id == "session2"
+
+        # Verify session1 was removed from the index
+        location = await archive.index.get_session_location("session1")
+        assert location is None
+
+    @pytest.mark.asyncio
+    async def test_get_session_removes_stale_entry(
+        self, archive: SessionArchive, archive_dir: Path, sample_session_data: dict
+    ) -> None:
+        """Test that get_session removes stale index entry for deleted file."""
+        await archive.archive_session("session1", sample_session_data)
+
+        # Verify session is in the index
+        location = await archive.index.get_session_location("session1")
+        assert location is not None
+
+        # Manually delete the session file
+        session_file = archive_dir / location / "session1.json"
+        session_file.unlink()
+
+        # Get session - should return None and remove stale entry
+        result = await archive.get_session("session1")
+
+        assert result is None
+        # Verify it was removed from the index
+        location = await archive.index.get_session_location("session1")
+        assert location is None
