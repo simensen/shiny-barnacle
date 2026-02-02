@@ -309,6 +309,7 @@ class SessionTracker:
                     direction="request",
                     role=msg.get("role", "unknown"),
                     content=content,
+                    tool_calls=msg.get("tool_calls"),  # Extract tool_calls consistently
                     debug=msg,  # Original JSON payload
                 )
                 session.messages.append(message)
