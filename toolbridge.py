@@ -24,7 +24,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
 from xml.sax.saxutils import unescape as xml_unescape
@@ -158,18 +158,33 @@ class SessionTracker:
         session_timeout: int = 3600,
         message_buffer_size: int = 1024,
         archive: SessionArchive | None = None,
+        archive_on_change: bool = False,
+        archive_debounce_seconds: float = 2.0,
     ):
         """
         Args:
             session_timeout: Seconds of inactivity before session expires (default 1 hour)
             message_buffer_size: Max messages per session circular buffer (default 1024)
             archive: Optional SessionArchive for persisting expired sessions
+            archive_on_change: If True, archive sessions after each change (debounced)
+            archive_debounce_seconds: Seconds to wait after last change before archiving
         """
         self._sessions: dict[str, SessionStats] = {}
         self._lock = asyncio.Lock()
         self.session_timeout = session_timeout
         self.message_buffer_size = message_buffer_size
         self.archive = archive
+        self.archive_on_change = archive_on_change
+        self.archive_debounce_seconds = archive_debounce_seconds
+
+        # Dirty session tracking for debounced archiving
+        # Maps session_id -> timestamp when first marked dirty (after last flush)
+        self._dirty_sessions: dict[str, float] = {}
+        self._dirty_lock = asyncio.Lock()
+
+        # Background flush task
+        self._flush_task: asyncio.Task[None] | None = None
+        self._shutdown = False
 
     def get_session_id(self, request: dict[str, Any], client_ip: str | None = None) -> str:
         """
@@ -244,6 +259,9 @@ class SessionTracker:
             if client_ip and not session_stats.client_ip:
                 session_stats.client_ip = client_ip
 
+        # Mark session as dirty for debounced archiving
+        await self._mark_dirty(session_id)
+
         return session_id
 
     async def get_session_stats(self, session_id: str) -> SessionStats | None:
@@ -275,6 +293,7 @@ class SessionTracker:
             debug: Original JSON payload (parsed)
             prompt_tokens: Snapshot of prompt_tokens at time of logging (for context size tracking)
         """
+        added = False
         async with self._lock:
             session = self._sessions.get(session_id)
             if session:
@@ -289,6 +308,11 @@ class SessionTracker:
                     prompt_tokens=prompt_tokens,
                 )
                 session.messages.append(message)
+                added = True
+
+        # Mark session as dirty for debounced archiving
+        if added:
+            await self._mark_dirty(session_id)
 
     async def add_request_messages(
         self,
@@ -308,6 +332,7 @@ class SessionTracker:
             messages: The full messages array from the request body
             prompt_tokens: Snapshot of prompt_tokens at time of logging (for context size tracking)
         """
+        added_count = 0
         async with self._lock:
             session = self._sessions.get(session_id)
             if not session:
@@ -331,9 +356,14 @@ class SessionTracker:
                     prompt_tokens=prompt_tokens,  # Context size at this point in conversation
                 )
                 session.messages.append(message)
+                added_count += 1
 
             # Update the count for next request
             session.last_request_message_count = len(messages)
+
+        # Mark session as dirty for debounced archiving
+        if added_count > 0:
+            await self._mark_dirty(session_id)
 
     async def get_all_sessions(self) -> dict[str, SessionStats]:
         """Get all active sessions (excludes expired)."""
@@ -363,7 +393,218 @@ class SessionTracker:
                 del self._sessions[sid]
                 removed += 1
 
+        # Clean up dirty tracking for expired sessions
+        if removed > 0:
+            async with self._dirty_lock:
+                for sid in expired_ids:
+                    self._dirty_sessions.pop(sid, None)
+
         return removed
+
+    async def _mark_dirty(self, session_id: str) -> None:
+        """Mark a session as dirty (needs to be persisted)."""
+        if not self.archive_on_change or self.archive is None:
+            return
+
+        async with self._dirty_lock:
+            if session_id not in self._dirty_sessions:
+                self._dirty_sessions[session_id] = time.time()
+
+    async def start_flush_loop(self) -> None:
+        """Start the background flush loop for debounced archiving."""
+        if not self.archive_on_change or self.archive is None:
+            return
+
+        self._shutdown = False
+        self._flush_task = asyncio.create_task(self._flush_loop())
+        logger.info("Started archive flush loop (debounce: %.1fs)", self.archive_debounce_seconds)
+
+    async def stop_flush_loop(self) -> None:
+        """Stop the background flush loop."""
+        self._shutdown = True
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._flush_task
+            self._flush_task = None
+
+    async def _flush_loop(self) -> None:
+        """Background task that periodically flushes dirty sessions."""
+        # Check frequently (every 500ms) to maintain responsiveness
+        check_interval = 0.5
+
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(check_interval)
+                await self._flush_ready_sessions()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in flush loop: %s", e)
+
+    async def _flush_ready_sessions(self) -> int:
+        """
+        Flush sessions that have been dirty longer than the debounce delay.
+
+        Returns:
+            Number of sessions flushed
+        """
+        if self.archive is None:
+            return 0
+
+        now = time.time()
+        flushed = 0
+
+        # Find sessions ready to flush
+        async with self._dirty_lock:
+            ready = [
+                sid
+                for sid, ts in self._dirty_sessions.items()
+                if now - ts >= self.archive_debounce_seconds
+            ]
+
+        # Persist each ready session
+        for session_id in ready:
+            if await self._persist_session(session_id):
+                flushed += 1
+                async with self._dirty_lock:
+                    self._dirty_sessions.pop(session_id, None)
+
+        return flushed
+
+    async def _persist_session(self, session_id: str) -> bool:
+        """
+        Persist a single session to the archive.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.archive is None:
+            return False
+
+        async with self._lock:
+            stats = self._sessions.get(session_id)
+            if stats is None:
+                return False
+            archive_data = session_stats_to_archive_dict(session_id, stats)
+
+        return await self.archive.archive_session(session_id, archive_data)
+
+    async def flush_all(self) -> int:
+        """
+        Flush all dirty sessions immediately (for graceful shutdown).
+
+        Returns:
+            Number of sessions flushed
+        """
+        if self.archive is None:
+            return 0
+
+        flushed = 0
+
+        # Get all dirty session IDs
+        async with self._dirty_lock:
+            dirty_ids = list(self._dirty_sessions.keys())
+
+        # Persist each dirty session
+        for session_id in dirty_ids:
+            if await self._persist_session(session_id):
+                flushed += 1
+                async with self._dirty_lock:
+                    self._dirty_sessions.pop(session_id, None)
+
+        if flushed > 0:
+            logger.info("Flushed %d sessions on shutdown", flushed)
+
+        return flushed
+
+    async def restore_from_archive(self, max_age_seconds: int | None = None) -> int:
+        """
+        Restore recent sessions from archive into memory.
+
+        This enables crash recovery by reloading sessions that were archived
+        before shutdown but haven't expired yet.
+
+        Args:
+            max_age_seconds: Only restore sessions active within this many seconds.
+                            Defaults to session_timeout.
+
+        Returns:
+            Number of sessions restored
+        """
+        if self.archive is None:
+            return 0
+
+        if max_age_seconds is None:
+            max_age_seconds = self.session_timeout
+
+        now = time.time()
+        cutoff = now - max_age_seconds
+        restored = 0
+
+        # Get all archived sessions
+        summaries = await self.archive.list_sessions(limit=1000)
+
+        for summary in summaries:
+            # Skip sessions that are too old
+            if summary.last_seen_at < cutoff:
+                continue
+
+            # Skip sessions already in memory
+            if summary.session_id in self._sessions:
+                continue
+
+            # Load full session data
+            session_data = await self.archive.get_session(summary.session_id)
+            if session_data is None:
+                continue
+
+            # Reconstruct SessionStats
+            messages: deque[ChatMessage] = deque(maxlen=self.message_buffer_size)
+            for msg_data in session_data.get("messages", []):
+                messages.append(
+                    ChatMessage(
+                        timestamp=msg_data.get("timestamp", 0),
+                        direction=msg_data.get("direction", ""),
+                        role=msg_data.get("role", ""),
+                        content=msg_data.get("content", ""),
+                        tool_calls=msg_data.get("tool_calls"),
+                        raw_content=msg_data.get("raw_content"),
+                        debug=msg_data.get("debug"),
+                        prompt_tokens=msg_data.get("prompt_tokens"),
+                    )
+                )
+
+            stats = SessionStats(
+                created_at=session_data.get("created_at", now),
+                last_seen_at=session_data.get("last_seen_at", now),
+                request_count=session_data.get("request_count", 0),
+                tool_calls_total=session_data.get("tool_calls_total", 0),
+                tool_calls_fixed=session_data.get("tool_calls_fixed", 0),
+                tool_calls_failed=session_data.get("tool_calls_failed", 0),
+                client_ip=session_data.get("client_ip"),
+                messages=messages,
+                last_request_message_count=len(session_data.get("messages", [])),
+                last_prompt_tokens=session_data.get("last_prompt_tokens", 0),
+                last_completion_tokens=session_data.get("last_completion_tokens", 0),
+                last_total_tokens=session_data.get("last_total_tokens", 0),
+                prompt_tokens_total=session_data.get("prompt_tokens_total", 0),
+                completion_tokens_total=session_data.get("completion_tokens_total", 0),
+                total_tokens_total=session_data.get("total_tokens_total", 0),
+            )
+
+            async with self._lock:
+                self._sessions[summary.session_id] = stats
+            restored += 1
+
+        if restored > 0:
+            logger.info("Restored %d sessions from archive", restored)
+
+        return restored
+
+    def get_dirty_count(self) -> int:
+        """Get number of dirty sessions pending flush (for monitoring)."""
+        return len(self._dirty_sessions)
 
 
 # Global session tracker instance
@@ -501,6 +742,14 @@ class ProxyConfig(BaseSettings):
         default=168,
         description="Hours to retain archived sessions (0 = forever, default: 168 = 7 days)",
     )
+    archive_on_change: bool = Field(
+        default=True,
+        description="Archive sessions immediately after changes (enables crash recovery)",
+    )
+    archive_debounce_seconds: float = Field(
+        default=2.0,
+        description="Seconds to wait after last change before archiving (debounce delay)",
+    )
 
 
 def load_config() -> ProxyConfig:
@@ -531,10 +780,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 f"  Archive validated: {validation_result['session_count']} sessions"
             )
 
+    # Restore recent sessions from archive (if archive-on-change is enabled)
+    if session_tracker.archive_on_change and session_tracker.archive is not None:
+        restored = await session_tracker.restore_from_archive()
+        if restored > 0:
+            logger.info(f"  Restored {restored} active sessions from archive")
+
+    # Start the background flush loop for debounced archiving
+    await session_tracker.start_flush_loop()
+
     yield  # App runs here
 
-    # Shutdown: nothing to do currently
-    pass
+    # Shutdown: flush all dirty sessions to archive
+    logger.info("Shutting down - flushing sessions to archive...")
+    await session_tracker.stop_flush_loop()
+    flushed = await session_tracker.flush_all()
+    if flushed > 0:
+        logger.info(f"  Flushed {flushed} sessions to archive")
 
 
 app = FastAPI(title="LLM Response Transformer Proxy", lifespan=lifespan)
@@ -2086,6 +2348,8 @@ Environment Variables:
   TOOLBRIDGE_ARCHIVE_ENABLED   Enable session archiving (true/false, default: true)
   TOOLBRIDGE_ARCHIVE_DIR       Archive directory (default: XDG state dir)
   TOOLBRIDGE_ARCHIVE_TTL_HOURS Hours to retain archives (default: 168 = 7 days)
+  TOOLBRIDGE_ARCHIVE_ON_CHANGE Archive sessions on change for crash recovery (default: true)
+  TOOLBRIDGE_ARCHIVE_DEBOUNCE_SECONDS  Debounce delay for archive writes (default: 2.0)
 
 Examples:
   # Basic usage (reads from env vars / .env if available)
@@ -2263,6 +2527,22 @@ Examples:
             "168",
         ),
     )
+    archive_group.add_argument(
+        "--no-archive-on-change",
+        action="store_true",
+        help="Disable immediate archiving on session changes "
+        "(disables crash recovery) [env: TOOLBRIDGE_ARCHIVE_ON_CHANGE=false]",
+    )
+    archive_group.add_argument(
+        "--archive-debounce",
+        type=float,
+        default=None,
+        help=_env_help(
+            "TOOLBRIDGE_ARCHIVE_DEBOUNCE_SECONDS",
+            "Seconds to wait after last change before archiving",
+            "2.0",
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2318,6 +2598,10 @@ Examples:
         config.archive_dir = args.archive_dir
     if args.archive_ttl is not None:
         config.archive_ttl_hours = args.archive_ttl
+    if args.no_archive_on_change:
+        config.archive_on_change = False
+    if args.archive_debounce is not None:
+        config.archive_debounce_seconds = args.archive_debounce
 
     # Debug mode - can be set via CLI or env var
     if args.debug:
@@ -2340,6 +2624,8 @@ Examples:
         session_timeout=3600,
         message_buffer_size=config.message_buffer_size,
         archive=session_archive,
+        archive_on_change=config.archive_on_change and config.archive_enabled,
+        archive_debounce_seconds=config.archive_debounce_seconds,
     )
 
     # Apply debug logging level
@@ -2447,6 +2733,12 @@ Examples:
         )
         logger.info(f"  Session archive: enabled (TTL: {ttl_display})")
         logger.info(f"  Archive directory: {session_archive.archive_dir}")
+        if config.archive_on_change:
+            logger.info(
+                f"  Archive on change: enabled (debounce: {config.archive_debounce_seconds}s)"
+            )
+        else:
+            logger.info("  Archive on change: disabled")
     else:
         logger.info("  Session archive: disabled")
 

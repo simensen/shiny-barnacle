@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,9 @@ from archive import (
     session_stats_to_archive_dict,
 )
 from paths import ensure_dir, get_archive_dir, get_state_home
+
+if TYPE_CHECKING:
+    from toolbridge import SessionTracker
 
 
 class TestPaths:
@@ -573,3 +577,227 @@ class TestLazyCleanup:
         # Verify it was removed from the index
         location = await archive.index.get_session_location("session1")
         assert location is None
+
+
+class TestDebouncedArchiving:
+    """Tests for debounced archive-on-change functionality."""
+
+    @pytest.fixture
+    def archive_dir(self) -> Path:
+        """Create a temporary archive directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def archive(self, archive_dir: Path) -> SessionArchive:
+        """Create a SessionArchive instance."""
+        return SessionArchive(archive_dir=archive_dir, archive_ttl_hours=168)
+
+    @pytest.fixture
+    def tracker(self, archive: SessionArchive) -> "SessionTracker":
+        """Create a SessionTracker with archive-on-change enabled."""
+        from toolbridge import SessionTracker
+
+        return SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=archive,
+            archive_on_change=True,
+            archive_debounce_seconds=0.5,  # Short debounce for testing
+        )
+
+    @pytest.mark.asyncio
+    async def test_mark_dirty_on_track_request(self, tracker: "SessionTracker") -> None:
+        """Test that track_request marks session as dirty."""
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+
+        session_id = await tracker.track_request(request, client_ip="127.0.0.1")
+
+        assert tracker.get_dirty_count() == 1
+        assert session_id in tracker._dirty_sessions
+
+    @pytest.mark.asyncio
+    async def test_mark_dirty_on_add_message(self, tracker: "SessionTracker") -> None:
+        """Test that add_message marks session as dirty."""
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        session_id = await tracker.track_request(request, client_ip="127.0.0.1")
+
+        # Clear dirty state
+        tracker._dirty_sessions.clear()
+        assert tracker.get_dirty_count() == 0
+
+        # Add a message
+        await tracker.add_message(session_id, "response", "assistant", "Hi there!")
+
+        assert tracker.get_dirty_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_debounced_flush(
+        self, tracker: "SessionTracker", archive: SessionArchive
+    ) -> None:
+        """Test that sessions are flushed after debounce delay."""
+        import asyncio
+
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        session_id = await tracker.track_request(request, client_ip="127.0.0.1")
+
+        # Session should be dirty but not yet archived
+        assert tracker.get_dirty_count() == 1
+        assert await archive.get_session(session_id) is None
+
+        # Wait for debounce delay + some margin
+        await asyncio.sleep(0.6)
+
+        # Manually trigger flush check (simulating the background loop)
+        flushed = await tracker._flush_ready_sessions()
+
+        assert flushed == 1
+        assert tracker.get_dirty_count() == 0
+
+        # Session should now be in archive
+        archived = await archive.get_session(session_id)
+        assert archived is not None
+        assert archived["client_ip"] == "127.0.0.1"
+
+    @pytest.mark.asyncio
+    async def test_flush_all_on_shutdown(
+        self, tracker: "SessionTracker", archive: SessionArchive
+    ) -> None:
+        """Test that flush_all persists all dirty sessions immediately."""
+        # Create multiple sessions
+        for i in range(3):
+            request = {"messages": [{"role": "user", "content": f"hello {i}"}]}
+            await tracker.track_request(request, client_ip=f"127.0.0.{i}")
+
+        assert tracker.get_dirty_count() == 3
+
+        # Flush all immediately (as on shutdown)
+        flushed = await tracker.flush_all()
+
+        assert flushed == 3
+        assert tracker.get_dirty_count() == 0
+
+        # All sessions should be in archive
+        summaries = await archive.list_sessions()
+        assert len(summaries) == 3
+
+    @pytest.mark.asyncio
+    async def test_restore_from_archive(
+        self, tracker: "SessionTracker", archive: SessionArchive
+    ) -> None:
+        """Test that recent sessions are restored from archive on startup."""
+        # Create and archive a session
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        session_id = await tracker.track_request(request, client_ip="127.0.0.1")
+        # Add request messages (simulates what the proxy does)
+        await tracker.add_request_messages(session_id, request["messages"])
+        await tracker.add_message(session_id, "response", "assistant", "Hi!")
+
+        # Flush to archive
+        await tracker.flush_all()
+
+        # Create a new tracker (simulating restart)
+        from toolbridge import SessionTracker
+
+        new_tracker = SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=archive,
+            archive_on_change=True,
+            archive_debounce_seconds=0.5,
+        )
+
+        # Verify session is not in memory yet
+        assert session_id not in new_tracker._sessions
+
+        # Restore from archive
+        restored = await new_tracker.restore_from_archive()
+
+        assert restored == 1
+        assert session_id in new_tracker._sessions
+
+        # Verify restored session data
+        stats = await new_tracker.get_session_stats(session_id)
+        assert stats is not None
+        assert stats.client_ip == "127.0.0.1"
+        assert stats.request_count == 1
+        assert len(stats.messages) == 2  # user message + assistant message
+
+    @pytest.mark.asyncio
+    async def test_restore_skips_expired_sessions(
+        self, archive: SessionArchive
+    ) -> None:
+        """Test that restore_from_archive skips sessions older than timeout."""
+        from toolbridge import SessionTracker
+
+        # Archive a session with old last_seen_at
+        old_session_data = {
+            "session_id": "old_session",
+            "created_at": time.time() - 7200,  # 2 hours ago
+            "last_seen_at": time.time() - 7200,  # 2 hours ago (expired)
+            "request_count": 1,
+            "tool_calls_total": 0,
+            "tool_calls_fixed": 0,
+            "tool_calls_failed": 0,
+            "client_ip": "127.0.0.1",
+            "messages": [],
+        }
+        await archive.archive_session("old_session", old_session_data)
+
+        # Create tracker with 1 hour timeout
+        tracker = SessionTracker(
+            session_timeout=3600,  # 1 hour
+            message_buffer_size=100,
+            archive=archive,
+            archive_on_change=True,
+            archive_debounce_seconds=0.5,
+        )
+
+        # Restore should skip the expired session
+        restored = await tracker.restore_from_archive()
+
+        assert restored == 0
+        assert "old_session" not in tracker._sessions
+
+    @pytest.mark.asyncio
+    async def test_background_flush_loop(
+        self, tracker: "SessionTracker", archive: SessionArchive
+    ) -> None:
+        """Test that background flush loop runs and flushes sessions."""
+        import asyncio
+
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        session_id = await tracker.track_request(request, client_ip="127.0.0.1")
+
+        # Start the flush loop
+        await tracker.start_flush_loop()
+
+        try:
+            # Wait for debounce delay + flush check interval + margin
+            await asyncio.sleep(1.2)
+
+            # Session should have been flushed
+            assert tracker.get_dirty_count() == 0
+            archived = await archive.get_session(session_id)
+            assert archived is not None
+        finally:
+            # Stop the flush loop
+            await tracker.stop_flush_loop()
+
+    @pytest.mark.asyncio
+    async def test_no_archive_when_disabled(self) -> None:
+        """Test that sessions are not archived when archive_on_change is False."""
+        from toolbridge import SessionTracker
+
+        tracker = SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=None,  # No archive
+            archive_on_change=False,
+        )
+
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        await tracker.track_request(request, client_ip="127.0.0.1")
+
+        # Should not mark as dirty when archive_on_change is False
+        assert tracker.get_dirty_count() == 0
