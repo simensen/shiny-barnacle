@@ -36,6 +36,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agent_detection import detect_agent
 from archive import SessionArchive, session_stats_to_archive_dict
 from paths import get_archive_dir
 
@@ -143,6 +144,9 @@ class SessionStats:
     prompt_tokens_total: int = 0
     completion_tokens_total: int = 0
     total_tokens_total: int = 0
+    # Agent detection - set on first request
+    detected_agent: str | None = None
+    detected_agent_confidence: str | None = None  # "high", "medium", "low"
 
 
 class SessionTracker:
@@ -232,7 +236,8 @@ class SessionTracker:
         session_id = self.get_session_id(request, client_ip)
 
         async with self._lock:
-            if session_id not in self._sessions:
+            is_new_session = session_id not in self._sessions
+            if is_new_session:
                 self._sessions[session_id] = SessionStats(
                     client_ip=client_ip,
                     messages=deque(maxlen=self.message_buffer_size),
@@ -258,6 +263,14 @@ class SessionTracker:
             # Update client IP if not set
             if client_ip and not session_stats.client_ip:
                 session_stats.client_ip = client_ip
+
+            # Detect agent on first request (when session is created)
+            if is_new_session and session_stats.detected_agent is None:
+                messages = request.get("messages", [])
+                if messages:
+                    detection = detect_agent(messages)
+                    session_stats.detected_agent = detection.agent
+                    session_stats.detected_agent_confidence = detection.confidence
 
         # Mark session as dirty for debounced archiving
         await self._mark_dirty(session_id)
@@ -2019,6 +2032,9 @@ async def get_sessions(
                 "prompt_tokens_total": session_stats.prompt_tokens_total,
                 "completion_tokens_total": session_stats.completion_tokens_total,
                 "total_tokens_total": session_stats.total_tokens_total,
+                # Agent detection
+                "detected_agent": session_stats.detected_agent,
+                "detected_agent_confidence": session_stats.detected_agent_confidence,
                 "is_archived": False,
             }
     else:
@@ -2057,6 +2073,9 @@ async def get_sessions(
                 "prompt_tokens_total": summary.prompt_tokens_total,
                 "completion_tokens_total": summary.completion_tokens_total,
                 "total_tokens_total": summary.total_tokens_total,
+                # Agent detection
+                "detected_agent": summary.detected_agent,
+                "detected_agent_confidence": summary.detected_agent_confidence,
                 "is_archived": True,
             }
     elif include_archived or archived_only:
@@ -2109,6 +2128,9 @@ async def get_session(
             "prompt_tokens_total": session_stats.prompt_tokens_total,
             "completion_tokens_total": session_stats.completion_tokens_total,
             "total_tokens_total": session_stats.total_tokens_total,
+            # Agent detection
+            "detected_agent": session_stats.detected_agent,
+            "detected_agent_confidence": session_stats.detected_agent_confidence,
             "is_archived": False,
         }
 
@@ -2166,6 +2188,9 @@ async def get_session(
                 "prompt_tokens_total": archived_data.get("prompt_tokens_total", 0),
                 "completion_tokens_total": archived_data.get("completion_tokens_total", 0),
                 "total_tokens_total": archived_data.get("total_tokens_total", 0),
+                # Agent detection
+                "detected_agent": archived_data.get("detected_agent"),
+                "detected_agent_confidence": archived_data.get("detected_agent_confidence"),
                 "is_archived": True,
             }
 

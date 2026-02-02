@@ -46,6 +46,9 @@ class ArchivedSessionSummary:
     prompt_tokens_total: int
     completion_tokens_total: int
     total_tokens_total: int
+    # Agent detection
+    detected_agent: str | None = None
+    detected_agent_confidence: str | None = None
 
 
 class ArchiveIndex:
@@ -563,6 +566,8 @@ class SessionArchive:
                     prompt_tokens_total=session_data.get("prompt_tokens_total", 0),
                     completion_tokens_total=session_data.get("completion_tokens_total", 0),
                     total_tokens_total=session_data.get("total_tokens_total", 0),
+                    detected_agent=session_data.get("detected_agent"),
+                    detected_agent_confidence=session_data.get("detected_agent_confidence"),
                 ))
 
         return summaries
@@ -699,5 +704,7 @@ def session_stats_to_archive_dict(
         "prompt_tokens_total": stats.prompt_tokens_total,
         "completion_tokens_total": stats.completion_tokens_total,
         "total_tokens_total": stats.total_tokens_total,
+        "detected_agent": stats.detected_agent,
+        "detected_agent_confidence": stats.detected_agent_confidence,
         "messages": messages,
     }

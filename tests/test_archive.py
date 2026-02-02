@@ -321,6 +321,8 @@ class TestSessionStatsToArchiveDict:
             completion_tokens_total: int
             total_tokens_total: int
             messages: deque
+            detected_agent: str | None
+            detected_agent_confidence: str | None
 
         stats = MockSessionStats(
             created_at=1000.0,
@@ -348,6 +350,8 @@ class TestSessionStatsToArchiveDict:
                     prompt_tokens=50,
                 )
             ]),
+            detected_agent="Cline",
+            detected_agent_confidence="high",
         )
 
         result = session_stats_to_archive_dict("session123", stats)
@@ -360,6 +364,8 @@ class TestSessionStatsToArchiveDict:
         assert result["client_ip"] == "127.0.0.1"
         assert len(result["messages"]) == 1
         assert result["messages"][0]["content"] == "Hello"
+        assert result["detected_agent"] == "Cline"
+        assert result["detected_agent_confidence"] == "high"
 
 
 class TestArchiveIndexValidation:
