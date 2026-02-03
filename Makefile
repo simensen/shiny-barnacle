@@ -31,15 +31,15 @@ dev:
 
 # Run the proxy locally
 run:
-	python toolbridge.py
+	python3 toolbridge.py
 
 # Run tests
 test:
-	python -m pytest tests/ -v
+	python3 -m pytest tests/ -v
 
 # Run tests with coverage
 coverage:
-	python -m pytest tests/ -v --cov=. --cov-report=html --cov-report=term
+	python3 -m pytest tests/ -v --cov=. --cov-report=html --cov-report=term
 
 # Run linter
 lint:
