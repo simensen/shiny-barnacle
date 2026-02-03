@@ -123,8 +123,8 @@ KNOWN_AGENTS: list[AgentPattern] = [
     ),
 ]
 
-# Generic fallback pattern: "You are X" where X is a single word
-GENERIC_YOU_ARE_PATTERN = re.compile(r"You are (\w+)\b", re.IGNORECASE)
+# Generic fallback pattern: "You are X" where X is a single word (more restrictive)
+GENERIC_YOU_ARE_PATTERN = re.compile(r"You are ([A-Z][a-zA-Z]+)\b", re.IGNORECASE)
 
 # Words to exclude from generic detection (common in general prompts)
 GENERIC_EXCLUSIONS = frozenset({
@@ -152,6 +152,16 @@ GENERIC_EXCLUSIONS = frozenset({
     "currently",
     "always",
     "never",
+    "benefit",
+    "limit",
+    "delete",
+    "statement",
+    "sql",
+    "database",
+    "query",
+    "optimization",
+    "performance",
+    "execution",
 })
 
 
@@ -159,8 +169,8 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
     """
     Detect the agent/client based on message content.
 
-    Examines the first `sample_size` characters of system messages and
-    early user messages to identify the agent.
+    Examines the first `sample_size` characters of system messages only to identify the agent.
+    This approach focuses specifically on system prompts which typically contain agent identification.
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys
@@ -172,7 +182,7 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
     if not messages:
         return DetectionResult(agent="Unknown", confidence="low")
 
-    # Build sample text from system messages and first user message
+    # Build sample text from system messages only
     sample_parts: list[str] = []
     chars_collected = 0
 
@@ -197,17 +207,11 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
         if not content:
             continue
 
-        # Prioritize system messages
+        # Only examine system messages for agent detection
         if role == "system":
             remaining = sample_size - chars_collected
             sample_parts.append(content[:remaining])
             chars_collected += min(len(content), remaining)
-        elif role == "user" and chars_collected < sample_size:
-            # Also check first user message (some agents put identity there)
-            remaining = sample_size - chars_collected
-            sample_parts.append(content[:remaining])
-            chars_collected += min(len(content), remaining)
-            break  # Only use first user message
 
     if not sample_parts:
         return DetectionResult(agent="Unknown", confidence="low")
@@ -220,7 +224,7 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
             if pattern.search(sample_text):
                 return DetectionResult(agent=agent_pattern.name, confidence="high")
 
-    # Try generic "You are X" pattern
+    # Try generic "You are X" pattern (only on system prompts)
     match = GENERIC_YOU_ARE_PATTERN.search(sample_text)
     if match:
         candidate = match.group(1)
