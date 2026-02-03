@@ -169,8 +169,10 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
     """
     Detect the agent/client based on message content.
 
-    Examines the first `sample_size` characters of system messages only to identify the agent.
-    This approach focuses specifically on system prompts which typically contain agent identification.
+    Examines the first `sample_size` characters of messages to identify the agent.
+    This approach looks at both system prompts (which typically contain agent identification) 
+    and the very first message to handle cases where agents like Cline send their system
+    prompt as a user message instead of a system message.
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys
@@ -182,10 +184,36 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
     if not messages:
         return DetectionResult(agent="Unknown", confidence="low")
 
-    # Build sample text from system messages only
+    # Build sample text from all messages, prioritizing first message for known patterns
     sample_parts: list[str] = []
     chars_collected = 0
+    
+    # First, check the very first message for known patterns (to handle cases like Cline)
+    # But only if it has a role that isn't empty or "system" to avoid breaking existing logic
+    first_message_content = ""
+    if messages:
+        msg = messages[0]
+        role = msg.get("role", "")
+        content = msg.get("content", "")
 
+        # Handle content that might be a list (multimodal)
+        if isinstance(content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            content = " ".join(text_parts)
+
+        if content and role != "":
+            first_message_content = content
+            remaining = sample_size - chars_collected
+            sample_parts.append(content[:remaining])
+            chars_collected += min(len(content), remaining)
+
+    # Then collect system messages for generic detection
     for msg in messages:
         if chars_collected >= sample_size:
             break
@@ -207,7 +235,8 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
         if not content:
             continue
 
-        # Only examine system messages for agent detection
+        # Only examine system messages for generic pattern matching 
+        # (to maintain security/accuracy of fuzzy detection)
         if role == "system":
             remaining = sample_size - chars_collected
             sample_parts.append(content[:remaining])
@@ -218,19 +247,51 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
 
     sample_text = " ".join(sample_parts)
 
-    # Try known agent patterns first
+    # Try known agent patterns first (from the first message or any message)
     for agent_pattern in KNOWN_AGENTS:
         for pattern in agent_pattern.patterns:
             if pattern.search(sample_text):
                 return DetectionResult(agent=agent_pattern.name, confidence="high")
 
-    # Try generic "You are X" pattern (only on system prompts)
-    match = GENERIC_YOU_ARE_PATTERN.search(sample_text)
-    if match:
-        candidate = match.group(1)
-        # Filter out common non-agent words
-        if candidate.lower() not in GENERIC_EXCLUSIONS:
-            return DetectionResult(agent=candidate, confidence="medium")
+    # Try generic "You are X" pattern (only on system prompts to maintain security)
+    # This is done by searching only in the system prompt portion
+    system_prompt_text = ""
+    system_chars_collected = 0
+    
+    for msg in messages:
+        if system_chars_collected >= sample_size:
+            break
+            
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # Handle content that might be a list (multimodal)
+        if isinstance(content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            content = " ".join(text_parts)
+
+        if not content:
+            continue
+
+        # Only examine system messages for generic pattern matching 
+        if role == "system":
+            remaining = sample_size - system_chars_collected
+            system_prompt_text += content[:remaining] + " "
+            system_chars_collected += min(len(content), remaining)
+
+    if system_prompt_text:
+        match = GENERIC_YOU_ARE_PATTERN.search(system_prompt_text)
+        if match:
+            candidate = match.group(1)
+            # Filter out common non-agent words
+            if candidate.lower() not in GENERIC_EXCLUSIONS:
+                return DetectionResult(agent=candidate, confidence="medium")
 
     return DetectionResult(agent="Unknown", confidence="low")
 
