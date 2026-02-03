@@ -797,6 +797,8 @@ class SessionTracker:
                 prompt_tokens_total=session_data.get("prompt_tokens_total", 0),
                 completion_tokens_total=session_data.get("completion_tokens_total", 0),
                 total_tokens_total=session_data.get("total_tokens_total", 0),
+                detected_agent=session_data.get("detected_agent"),
+                detected_agent_confidence=session_data.get("detected_agent_confidence"),
                 secondary_fingerprint=secondary_fp,
             )
 

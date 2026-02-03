@@ -732,6 +732,45 @@ class TestDebouncedArchiving:
         assert len(stats.messages) == 2  # user message + assistant message
 
     @pytest.mark.asyncio
+    async def test_restore_from_archive_preserves_detected_agent(
+        self, tracker: "SessionTracker", archive: SessionArchive
+    ) -> None:
+        """Test that detected_agent fields are restored from archive."""
+        # Create and archive a session with detected agent info
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        session_id = await tracker.track_request(request, client_ip="127.0.0.1")
+
+        # Manually set detected agent fields
+        async with tracker._lock:
+            stats = tracker._sessions[session_id]
+            stats.detected_agent = "TestAgent"
+            stats.detected_agent_confidence = "high"
+
+        # Flush to archive
+        await tracker.flush_all()
+
+        # Create a new tracker (simulating restart)
+        from toolbridge import SessionTracker
+
+        new_tracker = SessionTracker(
+            session_timeout=3600,
+            message_buffer_size=100,
+            archive=archive,
+            archive_on_change=True,
+            archive_debounce_seconds=0.5,
+        )
+
+        # Restore from archive
+        restored = await new_tracker.restore_from_archive()
+        assert restored == 1
+
+        # Verify detected_agent fields are restored
+        stats = await new_tracker.get_session_stats(session_id)
+        assert stats is not None
+        assert stats.detected_agent == "TestAgent"
+        assert stats.detected_agent_confidence == "high"
+
+    @pytest.mark.asyncio
     async def test_restore_skips_expired_sessions(
         self, archive: SessionArchive
     ) -> None:
