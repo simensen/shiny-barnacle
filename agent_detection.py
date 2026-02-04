@@ -93,6 +93,11 @@ KNOWN_AGENTS: list[AgentPattern] = [
             re.compile(r"You are OpenDevin\b", re.IGNORECASE),
         ],
     ),
+    # OpenCode
+    AgentPattern(
+        name="OpenCode",
+        patterns=[re.compile(r"You are opencode\b", re.IGNORECASE)],
+    ),
     # SWE-agent
     AgentPattern(
         name="SWE-agent",
@@ -127,42 +132,44 @@ KNOWN_AGENTS: list[AgentPattern] = [
 GENERIC_YOU_ARE_PATTERN = re.compile(r"You are ([A-Z][a-zA-Z]+)\b", re.IGNORECASE)
 
 # Words to exclude from generic detection (common in general prompts)
-GENERIC_EXCLUSIONS = frozenset({
-    "a",
-    "an",
-    "the",
-    "my",
-    "going",
-    "about",
-    "here",
-    "now",
-    "being",
-    "asked",
-    "expected",
-    "supposed",
-    "required",
-    "able",
-    "allowed",
-    "not",
-    "very",
-    "highly",
-    "extremely",
-    "quite",
-    "really",
-    "currently",
-    "always",
-    "never",
-    "benefit",
-    "limit",
-    "delete",
-    "statement",
-    "sql",
-    "database",
-    "query",
-    "optimization",
-    "performance",
-    "execution",
-})
+GENERIC_EXCLUSIONS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "my",
+        "going",
+        "about",
+        "here",
+        "now",
+        "being",
+        "asked",
+        "expected",
+        "supposed",
+        "required",
+        "able",
+        "allowed",
+        "not",
+        "very",
+        "highly",
+        "extremely",
+        "quite",
+        "really",
+        "currently",
+        "always",
+        "never",
+        "benefit",
+        "limit",
+        "delete",
+        "statement",
+        "sql",
+        "database",
+        "query",
+        "optimization",
+        "performance",
+        "execution",
+    }
+)
 
 
 def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> DetectionResult:
@@ -170,7 +177,7 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
     Detect the agent/client based on message content.
 
     Examines the first `sample_size` characters of messages to identify the agent.
-    This approach looks at both system prompts (which typically contain agent identification) 
+    This approach looks at both system prompts (which typically contain agent identification)
     and the very first message to handle cases where agents like Cline send their system
     prompt as a user message instead of a system message.
 
@@ -187,7 +194,7 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
     # Build sample text from all messages, prioritizing first message for known patterns
     sample_parts: list[str] = []
     chars_collected = 0
-    
+
     # First, check the very first message for known patterns (to handle cases like Cline)
     # But only if it has a role that isn't empty or "system" to avoid breaking existing logic
     first_message_content = ""
@@ -235,7 +242,7 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
         if not content:
             continue
 
-        # Only examine system messages for generic pattern matching 
+        # Only examine system messages for generic pattern matching
         # (to maintain security/accuracy of fuzzy detection)
         if role == "system":
             remaining = sample_size - chars_collected
@@ -257,11 +264,11 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
     # This is done by searching only in the system prompt portion
     system_prompt_text = ""
     system_chars_collected = 0
-    
+
     for msg in messages:
         if system_chars_collected >= sample_size:
             break
-            
+
         role = msg.get("role", "")
         content = msg.get("content", "")
 
@@ -279,7 +286,7 @@ def detect_agent(messages: list[dict[str, str]], sample_size: int = 512) -> Dete
         if not content:
             continue
 
-        # Only examine system messages for generic pattern matching 
+        # Only examine system messages for generic pattern matching
         if role == "system":
             remaining = sample_size - system_chars_collected
             system_prompt_text += content[:remaining] + " "

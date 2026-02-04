@@ -138,6 +138,18 @@ class TestKnownAgentDetection:
         assert result.agent == "Devin"
         assert result.confidence == "high"
 
+    def test_detect_opencode(self) -> None:
+        """Test detection of OpenCode agent."""
+        messages = [
+            {
+                "role": "system",
+                "content": "You are opencode, a highly skilled software engineering assistant.",
+            }
+        ]
+        result = detect_agent(messages)
+        assert result.agent == "OpenCode"
+        assert result.confidence == "high"
+
 
 class TestGenericDetection:
     """Test generic 'You are X' pattern detection."""
@@ -231,7 +243,7 @@ class TestEdgeCases:
                 "role": "system",
                 "content": [
                     {"type": "text", "text": "You are Cline, an AI assistant."},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
                 ],
             }
         ]
